@@ -1,0 +1,17 @@
+# index-service dependencies (CodeGraph MCP bridge).
+#
+# Exact direct pins; security updates are also resolved into requirements.lock.
+# The codegraph-server binary itself is provisioned outside pip — see
+# index-service/README.md §"取得 codegraph-server / Obtaining codegraph-server" for the
+# ARM aarch64 / glibc>=2.38 / v0.20.1 download-or-build + staging requirements.
+#
+# NOTE: the HTTP bridge uses `mcp.server.fastmcp.FastMCP` — the FastMCP class
+# BUNDLED inside the `mcp` package — NOT the unrelated standalone `fastmcp`
+# project. Do not add `fastmcp`; it is never imported. `mcp` pulls starlette /
+# uvicorn / sse-starlette transitively; we pin uvicorn explicitly because the
+# bridge runs the streamable-http (uvicorn) server directly.
+mcp==1.28.1       # stdio + FastMCP HTTP bridge; includes the 1.28.1 security fixes
+uvicorn==0.44.0   # ASGI server backing the streamable-http bridge
+typing_extensions==4.15.0  # explicit shim (some deps resolve against it)
+openpyxl==3.1.5   # read_table: parse Excel (.xlsx/.xls) config tables → text (read-only).
+                  # CSV/TSV/SQLite use the stdlib (csv/sqlite3); only Excel needs this.

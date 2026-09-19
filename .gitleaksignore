@@ -1,0 +1,64 @@
+# Exact immutable fingerprints for audited synthetic redaction fixtures and one
+# source-comment false positive in historical commit 4e72f1a. Do not add path-
+# or rule-level allowlists: every new finding must be reviewed independently.
+# The public clean import will not retain this private repository history.
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/src/index.ts:generic-api-key:1172
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:aws-access-token:10
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:aws-access-token:11
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:aws-access-token:302
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:aws-access-token:303
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:179
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:180
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:21
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:241
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:252
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:294
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:295
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:305
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:327
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:371
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:412
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:494
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:generic-api-key:62
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:jwt:159
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:npm-access-token:169
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:private-key:26
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:slack-bot-token:167
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/redact.test.ts:stripe-access-token:112
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/sanitize-answer.test.ts:generic-api-key:139
+4e72f1a94fc671d03489e94c18f1d142dd272522:bot-gateway/tests/sanitize-answer.test.ts:generic-api-key:74
+4e72f1a94fc671d03489e94c18f1d142dd272522:index-service/tests/test_glossary_build.py:aws-access-token:515
+
+# Audited synthetic redaction fixtures and the source-comment false positive in
+# source-truth sync commit dec4905. Exact commit fingerprints only.
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/src/index.ts:generic-api-key:1176
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:179
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:180
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:21
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:241
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:252
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:294
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:295
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:305
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:327
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:371
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:412
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:496
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:generic-api-key:62
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:jwt:159
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:slack-bot-token:167
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:stripe-access-token:112
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/sanitize-answer.test.ts:generic-api-key:278
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/sanitize-answer.test.ts:generic-api-key:75
+
+# Additional scanner findings in the same immutable sync commit. All are
+# synthetic redaction fixtures: AWS-shaped test IDs, a deliberately
+# invalid RSA block (MIIabc), and an alphabetic npm-token test string.
+# Keep the fixtures covered by tests; suppress only these exact findings.
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:aws-access-token:10
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:aws-access-token:11
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:private-key:26
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:npm-access-token:169
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:aws-access-token:302
+dec49050ede636a1743bb0709ef3f38914af6169:bot-gateway/tests/redact.test.ts:aws-access-token:303
+dec49050ede636a1743bb0709ef3f38914af6169:index-service/tests/test_glossary_build.py:aws-access-token:527

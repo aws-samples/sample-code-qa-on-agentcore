@@ -1,0 +1,1196 @@
+"""CodeGraph MCP-over-HTTP bridge (the HTTP half of index-service).
+
+codegraph-server speaks MCP over stdio only and its socket can't cross a
+Firecracker microVM. This bridge wraps the resident stdio session
+(codegraph_session) in a FastMCP streamable-HTTP server so session containers can
+query CodeGraph over HTTP. It also serves the repo's file content
+(read_file/glob_files) and text search (search_files) off the LOCAL repo copy, so
+the agent microVM needs NO filesystem mount — all code access is over HTTP. Tool
+results have their file paths rewritten via path_align into REPO-RELATIVE form
+before returning.
+
+Run as a resident service:
+    python -m http_bridge --workspace /data/repo/<subdir> --host 0.0.0.0 --port 8080 \
+        --local-workspace /data/repo/<subdir>
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import posixpath
+import shutil
+import sys
+from typing import Any
+
+from mcp.server.fastmcp import FastMCP
+
+import path_align
+from codegraph_session import CodegraphSession, IndexUnhealthy
+from repo_fanout import merge_fanout
+from repo_router import RepoRouter, RepoOutOfScope
+
+# NOTE: the bridge uses the RESIDENT CodegraphSession exclusively — spawning a
+# fresh codegraph process per query is the corruption-risk pattern the resident
+# session replaced, so it must never re-enter the production path.
+
+# APP CODE STALENESS. A re-bootstrap refreshes /opt/idx/app in place and does NOT restart the
+# resident bridges, so this process can keep executing code older than what is on disk (the lazy
+# tool imports below then load NEW module source into a process running OLD code). We snapshot the
+# app bundle's signature stamp at import time and expose a comparison on /health, so the skew is
+# observable instead of being inferred from behaviour. Reporting only — never a health gate, and a
+# no-op on a host where nothing stamps the file.
+# NOTE: this must match where the publishers stamp. bootstrap.sh writes /opt/idx/.app_sig and
+# says why in a comment: OUTSIDE $APP, so the rsync --delete-after that publishes the app tree
+# can never eat it. The default here used to be /opt/idx/app/.src_sig — a path nothing writes —
+# so _app_code_changed() was permanently False and the /health skew field was dead on arrival.
+_APP_SIG_PATH = os.environ.get("APP_SRC_SIG_PATH", "/opt/idx/.app_sig")
+
+
+def _read_app_sig() -> str:
+    try:
+        with open(_APP_SIG_PATH, encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+_APP_SIG_AT_START = _read_app_sig()
+
+
+def _app_code_changed() -> bool:
+    """True iff the on-disk app signature differs from the one this process started with."""
+    now = _read_app_sig()
+    return bool(now) and bool(_APP_SIG_AT_START) and now != _APP_SIG_AT_START
+
+# Per-WORKSPACE writer-lock fds, module-global so the GC can't collect them and
+# release the flocks mid-run. Keyed by the normalized workspace path → held fd, so a
+# multi-repo bridge that serves N workspaces in one process takes N DISTINCT flocks
+# (one per graph.db), NOT one process-wide lock. See acquire_singleton_writer_lock().
+_WRITER_LOCK_FDS: dict[str, Any] = {}
+
+
+class SingleWriterConflict(RuntimeError):
+    """Raised when another process already holds this workspace's writer flock."""
+
+
+def _lock_key(workspace: str) -> str:
+    """Normalize a workspace path to a stable lock-registry key (so '/d/r' and '/d/r/'
+    are the same lock). Mirrors the lock_path derivation."""
+    return workspace.rstrip("/")
+
+
+def acquire_singleton_writer_lock(workspace: str) -> None:
+    """SINGLE-WRITER HARD GUARD (do NOT rely on a comment). The whole no-corruption
+    invariant rests on exactly ONE process owning the codegraph-server that writes a
+    given graph.db. Take a process-lifetime exclusive flock keyed PER WORKSPACE BEFORE
+    that workspace's worker starts; if another process already holds it, raise instead
+    of becoming a second writer.
+
+    PER-WORKSPACE (multi-repo): a bridge process that serves N workspaces calls this
+    once per workspace and holds N independent flocks — locking workspace A must NOT
+    suppress locking workspace B (the bug a single process-wide fd would cause: repos
+    2..N silently unguarded → concurrent writers on their graph.db → 0-node corruption).
+
+    Called from build_bridge() (NOT just main()) so it guards EVERY caller of build_bridge —
+    tests, and any future entry point — rather than only the CLI. The original rationale named
+    an app-factory launch (`gunicorn http_bridge:app --workers N`), and that path does NOT
+    exist today: there is no module-level `app`, so that command fails with AttributeError.
+    The reason to keep the lock here is the general one, not that absent path (cross-review H1;
+    corrected after automated review pointed out the peer check and this lock disagreed about
+    exactly the entry point this comment claimed to defend — see build_asgi_app).
+    Idempotent PER WORKSPACE: if THIS process already holds this workspace's lock, it's a
+    no-op (same fd kept). A DIFFERENT process gets BlockingIOError on the non-blocking
+    acquire → SingleWriterConflict.
+    """
+    key = _lock_key(workspace)
+    if key in _WRITER_LOCK_FDS:
+        return  # this process already owns THIS workspace's lock
+    import fcntl
+    # Workspace-keyed lock file (stable across restarts; one per indexed repo). Lives
+    # next to the repo copy so it shares the graph.db's local disk (a real fs, not a
+    # tmpfs a container restart wipes). The held fd is kept in the module-global dict so
+    # it is not GC'd (which would release the lock) for the process lifetime.
+    lock_path = key + ".bridge.lock"
+    fd = open(lock_path, "w")  # noqa: SIM115 - held for process life
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError) as exc:
+        fd.close()
+        logger.error(json.dumps({"event": "bridge_singleton_conflict", "lock": lock_path,
+                                 "detail": "another bridge already owns this workspace; refusing to start a second graph.db writer",
+                                 "error": str(exc)}))
+        raise SingleWriterConflict(lock_path) from exc
+    fd.write(str(os.getpid()))
+    fd.flush()
+    _WRITER_LOCK_FDS[key] = fd
+
+logger = logging.getLogger("codegraph-bridge")
+
+# CodeGraph tools exposed over HTTP. Kept small + read-only (MVP evidence set).
+EXPOSED_TOOLS = (
+    "codegraph_symbol_search",
+    "codegraph_get_callers",
+    "codegraph_analyze_impact",
+)
+
+
+def _guarded(fn, *, bad_input: str, failed: str, log_event: str,
+             scope_warn_tool: str | None = None, fallback: str | None = None) -> str:
+    """Shared error envelope for the file/glossary tools. One policy, three tiers:
+
+    - RepoOutOfScope → "repo not in scope" (logged as a warning when
+      ``scope_warn_tool`` names the tool);
+    - ValueError → ``bad_input`` with the detail echoed — a ValueError from these
+      tools only ever carries agent-supplied input (a path/pattern), never a host
+      path, so it's safe to return;
+    - any other Exception → log ``log_event`` with the real error (an OSError etc.
+      can embed an absolute HOST path like /data/repo/... that must NEVER reach the
+      group-visible card) and return ``failed`` with a generic detail — or the
+      literal ``fallback`` JSON when given (the glossary tools' degraded payloads).
+    """
+    try:
+        return fn()
+    except RepoOutOfScope as exc:
+        if scope_warn_tool:
+            logger.warning(json.dumps({"event": "repo_out_of_scope",
+                                       "tool": scope_warn_tool, "detail": str(exc)}))
+        return json.dumps({"error": "repo not in scope", "detail": str(exc)})
+    except ValueError as exc:
+        return json.dumps({"error": bad_input, "detail": str(exc)})
+    except Exception as exc:  # noqa: BLE001 - isolate one query's failure
+        logger.error(json.dumps({"event": log_event, "error": str(exc)}))
+        if fallback is not None:
+            return fallback
+        return json.dumps({"error": failed, "detail": "internal error (see service logs)"})
+
+
+def _align_one(path: Any, *, index_root: str, repo: str = "") -> Any:
+    """Rewrite a single path into the agent's repo-relative namespace, or None if
+    it escapes the repo."""
+    if not isinstance(path, str) or not path:
+        return path
+    try:
+        return path_align.to_container_path(path, index_root=index_root, repo=repo)
+    except ValueError:
+        # Path escaped repo root — drop it rather than leak an out-of-repo path.
+        return None
+
+
+def _align_paths(raw_json: str, tool_name: str, *, index_root: str, repo: str = "") -> str:
+    """Rewrite every file path in a codegraph result into the agent's namespace.
+
+    Tool-aware: each of the three exposed tools returns a DIFFERENT envelope
+    (verified live against codegraph-server 0.18.5):
+      - symbol_search  → {"results": [{"symbol": {"location": {"file": ...}}}]}
+      - get_callers    → {"callers": [{"symbol": {"location": {"file": ...}},
+                                       "call_site": {"file": ...}}]}
+      - analyze_impact → {"impacted": [{"path": ...}], "indirect_impacted": [...]}
+
+    Best-effort: if the payload isn't the expected shape, return it unchanged
+    (the bridge must not corrupt results it doesn't understand).
+    """
+    try:
+        data = json.loads(raw_json)
+    except (ValueError, TypeError):
+        return raw_json
+    if not isinstance(data, dict):
+        return raw_json
+
+    def fix_location(item: Any) -> None:
+        # Null-safe chain: `item.get("symbol", {})` only defaults a MISSING key,
+        # not a JSON-null value, so a `{"symbol": null}` node (a real partial/
+        # unresolved codegraph result) would crash `None.get(...)`. Guard each hop.
+        sym = item.get("symbol") if isinstance(item, dict) else None
+        loc = sym.get("location") if isinstance(sym, dict) else None
+        if isinstance(loc, dict) and "file" in loc:
+            loc["file"] = _align_one(loc.get("file"), index_root=index_root, repo=repo)
+        # get_callers entries also carry a call_site with its own file path.
+        call_site = item.get("call_site") if isinstance(item, dict) else None
+        if isinstance(call_site, dict) and "file" in call_site:
+            call_site["file"] = _align_one(call_site.get("file"), index_root=index_root, repo=repo)
+            # 标注这个 line 的真实含义。实测 0.20.1 的 call_site.line 指向**调用者的声明行**，
+            # 不是调用发生的那一行。此前载荷里只有一个裸 `line`，agent 只能理解成「调用在这一行」，
+            # 于是照它写出的出处指向一个与调用无关的位置——出处看起来精确，实际错位，而且没有任何
+            # 一环报错。黄金测试集里 symbol_partial（只命中外层类型）多半就是这么来的。
+            #
+            # 不改写 line 本身：那是引擎给的事实，改了会让排查更难。加一个同义但明确的字段，
+            # 并声明它的语义，让 agent 引用时知道自己在引什么。
+            if isinstance(call_site.get("line"), int):
+                call_site["caller_declaration_line"] = call_site["line"]
+                call_site["line_semantics"] = (
+                    "declaration line of the CALLING symbol, not the line where the call occurs")
+
+    if tool_name == "codegraph_symbol_search":
+        for item in data.get("results", []) if isinstance(data.get("results"), list) else []:
+            fix_location(item)
+        # 引擎把 results 截断在 20 条，同时用 total_matches 报告真实命中数（实测见过 67）。
+        # 此前 total_matches 在整个 bridge 里出现 0 次，于是 agent 只看到 20 条却无从知道被截断，
+        # 答案会写成「共找到 20 处」——一个具体、可信、且错的数字。
+        #
+        # 不去补拉剩余结果：那要改引擎调用契约。这里只把「你看到的不是全部」这件事讲清楚，
+        # 让答案能诚实地说「至少 N 处，已列出前 20」。
+        results = data.get("results")
+        total = data.get("total_matches", data.get("totalMatches"))
+        if isinstance(results, list) and isinstance(total, int) and total > len(results):
+            data["truncated"] = True
+            data["shown"] = len(results)
+            data["total_matches"] = total
+            data["truncation_note"] = (
+                f"showing {len(results)} of {total} matches — the rest were not returned by the "
+                f"engine, so any count in the answer must be stated as 'at least {len(results)}'")
+    elif tool_name == "codegraph_get_callers":
+        for item in data.get("callers", []) if isinstance(data.get("callers"), list) else []:
+            fix_location(item)
+        _note_empty_call_graph(data, "callers")
+    elif tool_name == "codegraph_analyze_impact":
+        for key in ("impacted", "indirect_impacted", "direct_impacted"):
+            seq = data.get(key)
+            if isinstance(seq, list):
+                for item in seq:
+                    if isinstance(item, dict) and "path" in item:
+                        item["path"] = _align_one(item.get("path"), index_root=index_root, repo=repo)
+        _note_empty_call_graph(data, "impact")
+    return json.dumps(data, ensure_ascii=False)
+
+
+# 调用图为空时的措辞。这段注释是这个函数存在的全部理由，删掉它就没人知道为什么要加这个提示。
+#
+# 实测（daggerfall-unity，1040 个 .cs 文件）：`get_callers` 对**任何**符号都返回 `callers: []`，
+# 而 `diagnostic.node_found` 为 true——符号定位成功，只是查不到入边。`analyze_impact` 同样恒返回
+# `total_impacted: 0, risk_level: "low"`。
+#
+# 排查过程（每一步都否掉了一个更省事的假设）：
+#   * 解析失败不是主因 —— 失败率 22/1040（2%）
+#   * 图不是本轮建的   —— 日志 `Indexed 1029 files (0 parsed, 1029 skipped)`，
+#                          图来自 `Loaded persisted graph from previous session`
+#   * 强制全量重解析后 —— `1029 parsed, 0 skipped`，节点 18891→24164，引擎称
+#                          `Phase 2: resolved 1057 cross-file call edges`，
+#                          但入库边数仅 16397→16422（+25）。1057 条解析出来、25 条落库。
+#                          且重建后同一符号 node_id 从 4781 变成 24190——旧边指向的 id 已失效。
+#
+# 结论：引擎侧缺陷，不在本项目可修范围内。能做且必须做的只有一件事——**不要把「回答不了」
+# 表述成「答案是没有」**。空列表配上 `risk_level: low` 是本项目最危险的输出形态：它不是不准，
+# 而是语义上就是错的，且下游完全无从察觉。
+#
+# 这里刻意只加提示、不改成报错：符号确实可能真的没有调用者，把那种情况报成错误同样是撒谎。
+# 提示的作用是让答案能诚实地说「调用图查不到，已改用文本搜索确认」。
+_EMPTY_GRAPH_NOTE = (
+    "调用图中查不到该符号的调用关系，且引擎提示调用关系可能未被提取或索引需重建。"
+    "这**不等于**没有调用者/无影响——不要据此表述为「没有任何地方调用它」或「影响范围为零」。"
+    "请改用 search_files 做文本搜索来确认，并在答案里说明依据是文本搜索而非调用图。")
+
+
+def _note_empty_call_graph(data: dict, kind: str) -> None:
+    """当结果为空且引擎自己承认调用关系可能缺失时，附上提示。
+
+    放在 _align_paths 里而不是 merge_fanout 里：单仓路径直接返回 _align_paths 的结果，
+    根本不经过合并函数，而单仓恰恰是最常见的部署形态。同类错误本项目已犯过一次
+    （标量在多仓合并里被丢弃，而单仓正常——方向正好相反）。
+    """
+    diag = data.get("diagnostic")
+    note = str(diag.get("note") or "") if isinstance(diag, dict) else ""
+    # 引擎把「解析器不提取调用关系」「索引需重建」列为可能原因时，它自己就无法区分，我们也不能。
+    engine_admits = ("extract call relationships" in note) or ("need to be rebuilt" in note)
+
+    if kind == "callers":
+        empty = isinstance(data.get("callers"), list) and not data["callers"]
+        located = isinstance(diag, dict) and diag.get("node_found") is True
+        if empty and located and engine_admits:
+            data["call_graph_unavailable"] = True
+            data["call_graph_note"] = _EMPTY_GRAPH_NOTE
+        return
+
+    # analyze_impact 不返回 diagnostic，所以无法逐次判别。它的零影响与「图里没有边」在单次调用
+    # 里不可区分——这正是要说清的事，而不是可以沉默略过的事。
+    if data.get("symbol_id") is None:
+        return
+    zero = (data.get("total_impacted") == 0 and not (data.get("impacted") or [])
+            and not (data.get("indirect_impacted") or []))
+    if zero:
+        data["impact_zero_is_unverified"] = True
+        data["call_graph_note"] = _EMPTY_GRAPH_NOTE
+
+
+# symbol_search 的 score 下限。实测：精确匹配落在 0.75-0.97，纯语义噪声落在 0.33-0.43，
+# 0.60 在两者之间且离两端都有余量。低于此值时宁可报「没找到」——拿语义近似的符号当答案，
+# 会让后续 get_callers 返回 [] 并被读成「确认没有调用者」，产出一个看起来确定的错误结论。
+_SCORE_FLOOR = 0.60
+
+
+def _stable_pick(candidates: list[dict]) -> dict | None:
+    """在并列的候选里做**确定性**选择：按 (符号名, 文件, 行号) 排序取第一个。
+
+    引擎在同分时不保证顺序（实测同一查询 4 次，同为 1.0 的两个符号顺序来回换），所以不能依赖
+    "引擎给的第一个"——那等于抛硬币。排序键取符号自身的标识信息，同一份索引下恒定。
+    """
+    if not candidates:
+        return None
+
+    def key(item: dict) -> tuple[str, str, int]:
+        sym = item.get("symbol") if isinstance(item.get("symbol"), dict) else {}
+        loc = sym.get("location") if isinstance(sym.get("location"), dict) else {}
+        return (str(sym.get("name") or ""), str(loc.get("file") or ""),
+                int(loc.get("line")) if isinstance(loc.get("line"), int) else 0)
+
+    return sorted(candidates, key=key)[0]
+
+
+def _pick_symbol_match(results: list, query: str) -> dict | None:
+    """从 symbol_search 的结果里挑出真正对应 ``query`` 的那一条。
+
+    为什么不能取 ``results[0]``：codegraph 0.20.1 的语义回退会把非精确匹配排在前面。实测
+    ``to_container_path`` 的首条结果是 ``test_backslash_path_normalized_to_forward_slash``，
+    于是后续 ``get_callers`` 返回 ``[]``——而空列表在回答里会被当成权威结论「没有任何地方调用它」。
+    答案完全错，却没有任何一环报错。
+
+    引擎其实给了三个判别信号，此前全被丢掉：
+      * ``match_reason`` —— 精确名字匹配时为 ``SymbolName``
+      * ``score``       —— 实测精确匹配 0.75-0.97，语义噪声 0.33-0.43，区分度足够
+      * ``symbol_name`` —— 结果里对查询词的回显，可用于交叉核对
+
+    判别顺序（强到弱）：
+      1. ``match_reason == "SymbolName"`` 且 ``symbol.name`` 精确等于 query
+      2. ``symbol.name`` 精确等于 query（引擎未给 match_reason 时的退路）
+      3. ``score`` 最高且 >= _SCORE_FLOOR 的一条
+    三条都不满足时返回 None——宁可报「没找到」，也不要拿一个语义近似的符号去当答案，
+    因为后者会静默产出错误结论。
+    """
+    exact_with_reason: list[dict] = []
+    exact_only: list[dict] = []
+    scored: list[tuple[float, dict]] = []
+    # 被判别信号明确否掉的结果。单独记账，因为末尾的「只有一条就接受」兜底**不能**把它们救回来——
+    # 测试抓到过这个漏洞：回显 symbol_name 与 symbol.name 不一致的唯一一条结果，被兜底放行了。
+    disqualified = 0
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        sym = item.get("symbol")
+        name = sym.get("name") if isinstance(sym, dict) else None
+        # symbol_name 是引擎对查询词的回显；与 symbol.name 不一致说明这条结果不是在讲这个符号
+        echoed = item.get("symbol_name")
+        if isinstance(echoed, str) and echoed and echoed != name:
+            disqualified += 1
+            continue
+        reason = item.get("match_reason")
+        if name == query:
+            (exact_with_reason if reason == "SymbolName" else exact_only).append(item)
+        raw_score = item.get("score")
+        if isinstance(raw_score, (int, float)):
+            scored.append((float(raw_score), item))
+
+    if exact_with_reason:
+        return _stable_pick(exact_with_reason)
+    if exact_only:
+        return _stable_pick(exact_only)
+    if scored:
+        best_score = max(sc for sc, _ in scored)
+        if best_score >= _SCORE_FLOOR:
+            # 同分并列时必须有确定性的次级排序，否则同一查询每次挑到不同符号。
+            #
+            # 实测（同一查询连调 4 次）：codegraph 的 score 本身完全稳定——`MaxEncumbrance` 恒为
+            # 1.0、`GetMaxEncumbrance` 恒为 0.8875685334205627、total_matches 恒为 40。变的只是
+            # **同分项的相对顺序**：`MaxEncumbrance` 与 `EncumbranceMax` 同为 1.0，谁排第一每次都可
+            # 能不同；`DecreaseMagnitude`/`DecreaseMagicka`/`DecreaseFatigue` 同为 0.5603286027908325，
+            # 三者顺序随机轮换。像是底层用了无序容器或并行归并。
+            #
+            # 后果不是"排序不好看"：没有精确名匹配、只能靠最高分时，答案会跨轮指向不同符号，
+            # 于是同一个问题问两次得到不同出处。对一个宣称"代码是唯一依据"的系统，答案不可复现
+            # 是实质问题。按符号名排序打破并列，代价是可能不选引擎"本来"排第一的那个——但引擎
+            # 在同分时并没有稳定的"第一个"。
+            return _stable_pick([it for sc, it in scored if sc == best_score])
+        return None
+    # 引擎既没给 score 也没有精确匹配：只有一条结果时接受它（老版本引擎的行为），
+    # 多条时不猜——猜错会产出一个看起来确定的错误答案。被判别信号否掉过的结果不走这条兜底。
+    if disqualified:
+        return None
+    return results[0] if len(results) == 1 and isinstance(results[0], dict) else None
+
+
+def _parse_symbol_location(raw: str, query: str) -> tuple[str, int]:
+    """Pure parse of a symbol_search payload → index-space (uri, 0-based line).
+
+    Split out of _resolve_uri_line so the null-safe extraction is unit-testable
+    without a live codegraph subprocess. Raises ValueError for any unusable shape
+    (no results, null/non-dict symbol, missing location/line) so the caller
+    surfaces a clean "symbol not found" rather than a generic "{tool} failed".
+    """
+    data = json.loads(raw)
+    results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(results, list) or not results:
+        raise ValueError(f"no symbol matched query {query!r}")
+    # Null-safe chain (mirrors _align_paths.fix_location): a real partial hit can
+    # be `{"symbol": null}` or a non-dict; `.get("symbol", {})` only defaults a
+    # MISSING key, so a null VALUE would make `None.get("location")` raise
+    # AttributeError → mislabelled as an internal "{tool} failed".
+    top = _pick_symbol_match(results, query)
+    if top is None:
+        raise ValueError(
+            f"no symbol matched query {query!r} closely enough "
+            f"({len(results)} semantic-only result(s) rejected)")
+    sym = top.get("symbol") if isinstance(top, dict) else None
+    loc = sym.get("location") if isinstance(sym, dict) else None
+    index_file = loc.get("file") if isinstance(loc, dict) else None
+    line = loc.get("line") if isinstance(loc, dict) else None
+    if not index_file or not isinstance(line, int):
+        raise ValueError(f"symbol match for {query!r} has no usable location")
+    # codegraph identifies a symbol by file URI + 0-based line (verified live).
+    return f"file://{index_file}", line
+
+
+class _Repo:
+    """One served repo: its codegraph session + the paths the tools resolve against.
+
+    name      — repo identity (workspace basename); the <repo>/ path prefix + scope key.
+    workspace — index-space path codegraph indexes (for path_align index_root).
+    local     — local-disk copy the file tools read (read_file/glob/search/table).
+    session   — the resident CodegraphSession for this repo's graph.
+    """
+
+    __slots__ = ("name", "workspace", "local", "session")
+
+    def __init__(self, name: str, workspace: str, local: str | None, session: Any):
+        self.name = name
+        self.workspace = workspace
+        self.local = local
+        self.session = session
+
+
+def build_bridge(
+    *,
+    workspace: str | None = None,
+    workspaces: list[tuple[str, str | None]] | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    local_workspace: str | None = None,
+    project: str | None = None,
+) -> FastMCP:
+    """Build (but don't run) the FastMCP HTTP bridge for one or more CodeGraph repos.
+
+    Single-repo (today): pass ``workspace=`` (+ optional ``local_workspace=``). Multi-repo
+    (阶段2): pass ``workspaces=[(workspace, local_workspace), ...]`` — one resident session per
+    repo, all served by this one bridge process. The two forms are mutually exclusive.
+
+    Each repo's ``workspace`` is the index-service-side path codegraph-server indexes (a
+    LOCAL-disk copy); returned paths are rewritten into the agent's namespace — REPO-RELATIVE,
+    and PREFIXED with ``<repo>/`` so the agent can tell repos apart.
+    ``local_workspace`` is the copy the file tools read; post-EFS-removal it's the SAME path
+    as ``workspace``.
+
+    A graph/file tool takes an optional ``repo`` arg routed SERVER-SIDE through a whitelist
+    (不变量1): out-of-scope → rejected (never routed); in-scope → that repo's session; unset
+    with multiple repos → FAN OUT across all (results merged); unset with one repo → that repo.
+    """
+    if workspaces is None:
+        if workspace is None:
+            raise ValueError("build_bridge requires either workspace= or workspaces=")
+        workspaces = [(workspace, local_workspace)]
+    elif workspace is not None:
+        raise ValueError("pass either workspace= or workspaces=, not both")
+    if not workspaces:
+        raise ValueError("workspaces must be non-empty")
+
+    # ONE resident codegraph-server process per repo holds that repo's graph in memory for
+    # its whole lifetime. Spawning per-query instead re-scans the repo every call (~20s cold
+    # for ~8.7k files) — unusable on a request path. Each worker serializes calls on its own
+    # graph (codegraph isn't concurrent-safe); warm queries are single-digit ms.
+    # max_files must match the build phase, or a resident session re-scans with a different
+    # limit and rebuilds instead of loading the warm graph.
+    max_files = int(os.environ.get("CODEGRAPH_MAX_FILES", "10000"))
+
+    # GRAPH-HOME COORDINATION (不变量2): codegraph locates graph.db via $HOME/.codegraph, so the
+    # SERVE session MUST point at the SAME $HOME the BUILD wrote to, or it finds no graph and
+    # re-scans into an empty one (→ /health 503, "0 nodes"). bootstrap's index-build@<repo> unit
+    # ALWAYS builds with HOME=<workspace>/.home (per-repo, even for a single repo), so serve must
+    # ALWAYS use that same per-repo HOME — NOT just when multi-repo. (An earlier version only set
+    # it for >1 repo, so the single-repo serve inherited HOME=/data and served an empty
+    # /data/.codegraph while the build sat at <ws>/.home — caught in the first real deploy.)
+    # Per-repo HOME also gives multi-repo its required graph isolation (distinct HOME per repo).
+    repos: list[_Repo] = []
+    for ws, local in workspaces:
+        # SINGLE-WRITER GUARD per workspace — acquired HERE (before the worker spawns
+        # codegraph-server), not just in main(), so EVERY caller of build_bridge is guarded
+        # rather than only the CLI. Each workspace takes its OWN flock (see
+        # acquire_singleton_writer_lock / _WRITER_LOCK_FDS), whose docstring records why the
+        # original app-factory rationale no longer describes a path that exists.
+        acquire_singleton_writer_lock(ws)
+        home = ws.rstrip("/") + "/.home"
+        repos.append(_Repo(
+            name=posixpath.basename(ws.rstrip("/")),
+            workspace=ws,
+            local=local,
+            session=CodegraphSession(ws, max_files=max_files, home=home),
+        ))
+
+    by_name: dict[str, _Repo] = {r.name: r for r in repos}
+
+    # SERVER-SIDE SCOPE ENFORCEMENT (不变量1 / 阶段3 gate): the in-scope set is exactly the
+    # repos this bridge was built for. resolve() rejects any out-of-scope repo (never routes
+    # it — the cross-project leak this stops); returns the sole repo when unset+single; returns
+    # None when unset+multi (the caller fans out across all).
+    router = RepoRouter([r.name for r in repos])
+
+    # Back-compat single-repo handles: existing tests/inspection read app.codegraph_session
+    # and `session`. With one repo it IS that repo; with many, the "primary" is repos[0].
+    primary = repos[0]
+    session = primary.session
+
+    app = FastMCP(
+        name="codegraph-bridge", host=host, port=port,
+        stateless_http=True,
+    )
+
+    async def _resolve_uri_line(repo: _Repo, query: str) -> tuple[str, int]:
+        """Resolve a symbol query to an index-space (uri, 0-based line) IN ONE REPO.
+
+        get_callers/analyze_impact need a uri+line, but the agent only ever sees
+        repo-relative paths and can't supply an index-space uri. So the bridge
+        resolves the query itself via THIS repo's symbol_search session, taking the
+        top-ranked hit. Raises IndexUnhealthy on an unusable index; ValueError if the
+        symbol can't be located.
+        """
+        raw = await repo.session.call_tool("codegraph_symbol_search", {"query": query})
+        # Pure, null-safe parse (unit-tested in test_http_bridge_resolve.py): any
+        # unusable shape (null/non-dict symbol, missing location) raises ValueError
+        # → clean "symbol not found", never a generic "{tool} failed".
+        return _parse_symbol_location(raw, query)
+
+    async def _build_args(repo: _Repo, tool_name: str, query: str) -> dict[str, Any]:
+        """Map the uniform `query` UX onto each tool's real argument shape (per repo)."""
+        if tool_name == "codegraph_symbol_search":
+            return {"query": query}
+        # get_callers / analyze_impact require uri+line — resolve from the query.
+        uri, line = await _resolve_uri_line(repo, query)
+        return {"uri": uri, "line": line}
+
+    async def _run_on_repo(repo: _Repo, tool_name: str, query: str) -> str:
+        """Run one graph tool against ONE repo's session and return aligned JSON.
+
+        This is the PER-(repo,query) isolation boundary: every failure mode is caught
+        and turned into an error envelope JSON (never propagates), so in a fan-out one
+        repo's unhealthy/error can't blank the others — merge_fanout preserves
+        failures per repository and marks partial results; only an all-failed
+        query gets a top-level error.
+        """
+        try:
+            arguments = await _build_args(repo, tool_name, query)
+            raw = await repo.session.call_tool(tool_name, arguments)
+            # Align against THIS repo's workspace; prefix paths with <repo>/ (path honesty).
+            return _align_paths(raw, tool_name, index_root=repo.workspace, repo=repo.name)
+        except IndexUnhealthy as exc:
+            logger.error(json.dumps({"event": "refuse_unhealthy", "tool": tool_name,
+                                     "repo": repo.name, "detail": str(exc)}))
+            return json.dumps({"error": "index unavailable", "detail": str(exc)})
+        except ValueError as exc:
+            # Symbol not locatable for a caller/impact query — not an index fault, so
+            # report it as a normal "no match" without flipping health.
+            logger.info(json.dumps({"event": "tool_no_match", "tool": tool_name,
+                                     "repo": repo.name, "detail": str(exc)}))
+            return json.dumps({"error": f"{tool_name}: symbol not found", "detail": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - isolate one (repo,query) failure
+            # Generic detail only — str(exc) on an internal/transport error can carry
+            # host paths/frames that must not reach the group-visible card.
+            logger.error(json.dumps({"event": "tool_error", "tool": tool_name,
+                                     "repo": repo.name, "error": str(exc)}))
+            return json.dumps({"error": f"{tool_name} failed", "detail": "internal error (see service logs)"})
+
+    def _make_tool(tool_name: str):
+        # Uniform `query` arg → FastMCP generates a clean JSON schema and the
+        # agent has one consistent UX. For tools that actually need uri+line
+        # (get_callers, analyze_impact) the bridge resolves query→uri+line via
+        # symbol_search internally (see _build_args) — the agent can't supply an
+        # index-space uri because it only ever sees repo-relative paths.
+        async def _tool(query: str, repo: str | None = None) -> str:
+            # SERVER-SIDE SCOPE GATE FIRST (不变量1): resolve the agent's `repo` arg
+            # through the whitelist before ANY session work. out-of-scope → reject
+            # (never route); a specific in-scope repo → run there; unset + multiple
+            # repos → fan out across all and merge; unset + single → that sole repo.
+            try:
+                resolved = router.resolve(repo)
+            except RepoOutOfScope as exc:
+                logger.warning(json.dumps({"event": "repo_out_of_scope", "tool": tool_name, "detail": str(exc)}))
+                return json.dumps({"error": "repo not in scope", "detail": str(exc)})
+
+            if resolved is not None:
+                # Single target repo (explicit in-scope, or the sole repo when unset).
+                return await _run_on_repo(by_name[resolved], tool_name, query)
+
+            # FAN OUT: unset repo + multiple in scope → query each concurrently, merge.
+            # Each _run_on_repo isolates its own failure into an error envelope, so a
+            # gather here can't raise. The merge retains failed repository identities
+            # and marks partial coverage while preserving successful results.
+            per_repo = await asyncio.gather(*[_run_on_repo(r, tool_name, query) for r in repos])
+            return merge_fanout(
+                tool_name, list(per_repo), repo_names=[r.name for r in repos]
+            )
+
+        _tool.__name__ = tool_name
+        return _tool
+
+    # Every registered tool is READ-ONLY, IDEMPOTENT, and CLOSED-DOMAIN (they only query the
+    # local repo copy / in-memory graph — no writes, no external/open-world calls). The
+    # MCP spec's tool annotations default to the pessimistic (destructive, non-idempotent,
+    # open-world) when unset, so we set them explicitly: this is both honest metadata and
+    # lets a client safely auto-approve these evidence calls. (Annotations are advisory —
+    # the actual read-only guarantee is enforced by the closed allowlist + agent-side
+    # disallowed_tools, not by these hints.)
+    from mcp.types import ToolAnnotations
+    READONLY_ANNOT = ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                     idempotentHint=True, openWorldHint=False)
+
+    # Action-oriented descriptions so the model picks the right graph tool (the bare
+    # f"CodeGraph {name}" gave it nothing to disambiguate on). Per Anthropic "writing
+    # tools for agents": the description is the primary tool-selection signal.
+    GRAPH_TOOL_DESC = {
+        "codegraph_symbol_search": "Find a class/function/method by name or concept. "
+            "YOUR STARTING POINT when you don't yet know where code lives. `query` is a "
+            "symbol name or natural-language description; returns ranked matches with "
+            "repo-relative file:line locations.",
+        "codegraph_get_callers": "Find everything that calls a given symbol (reverse call "
+            "graph) — use for 'who uses X' / usage + impact. `query` is the symbol name "
+            "(resolved to the top match); returns the callers with repo-relative locations.",
+        "codegraph_analyze_impact": "Predict the blast radius of changing a symbol — what "
+            "depends on it. `query` is the symbol name (resolved to the top match). NOTE: "
+            "static call graph only; cross-check dynamic/reflection/config-driven uses with "
+            "codegraph_search_files.",
+    }
+    for name in EXPOSED_TOOLS:
+        app.add_tool(_make_tool(name), name=name,
+                     description=GRAPH_TOOL_DESC.get(name, f"CodeGraph {name} (read-only)."),
+                     annotations=READONLY_ANNOT)
+
+    # Fast file-content search/read over the LOCAL repo copy (replaces the agent's
+    # builtin Grep/Read, which hit EFS/NFS at ~20-47s per whole-repo search; local is
+    # ~0.2s). Registered only when EVERY served repo has a local copy on disk (single-
+    # repo: that's `local_workspace`; multi-repo: each repo's `.local`).
+    file_repos_ok = all(r.local and os.path.isdir(r.local) for r in repos)
+    if file_repos_ok:
+        import file_read
+        import file_search
+        import file_table
+
+        def _repo_for_path(path: str, explicit: str | None) -> _Repo:
+            """Route a PATH-based file tool (read_file/read_table) to ONE repo.
+
+            explicit `repo` (if given) wins and is whitelist-validated (out-of-scope →
+            RepoOutOfScope). Otherwise: single repo → the sole repo; multiple repos →
+            INFER from the path's leading ``<repo>/`` segment (graph/search prefix every
+            citation with it). If a multi-repo path has no recognizable prefix, refuse
+            rather than guess (the agent must prefix it or pass repo=)."""
+            resolved = router.resolve(explicit)  # explicit out-of-scope → RepoOutOfScope; unset+multi → None
+            if resolved is not None:
+                return by_name[resolved]
+            seg = (path or "").replace("\\", "/").lstrip("/").split("/", 1)[0]
+            if router.is_in_scope(seg):
+                return by_name[seg]
+            raise ValueError(
+                f"cannot tell which repo {path!r} is in — prefix it with '<repo>/' "
+                f"(one of {[r.name for r in repos]}) or pass repo="
+            )
+
+        def _file_targets(explicit: str | None) -> list[_Repo]:
+            """Route a PATTERN-based file tool (search/glob) to a repo SET.
+
+            explicit in-scope → [that repo]; out-of-scope → RepoOutOfScope; unset+single →
+            [the sole repo]; unset+multiple → ALL repos (fan out across the project)."""
+            resolved = router.resolve(explicit)
+            return [by_name[resolved]] if resolved is not None else list(repos)
+
+        def _merge_file_fanout(list_key: str, per_repo_json: list[str], repo_names: list[str]) -> str:
+            """Concatenate per-repo file-tool results (paths/matches already <repo>/-prefixed,
+            preserving each repository's metadata and failures. Partial coverage is independent
+            of truncation; an empty successful subset cannot prove there are no matches."""
+            merged: dict[str, Any] = {list_key: [], "truncated": False, "count": 0}
+            if list_key == "matches":
+                merged["deduped"] = 0
+            first_error: dict[str, Any] | None = None
+            repo_results: list[dict[str, Any]] = []
+            saw_ok = False
+            for index, (name, raw) in enumerate(zip(repo_names, per_repo_json, strict=True)):
+                try:
+                    d = json.loads(raw)
+                except (ValueError, TypeError):
+                    d = {"error": "invalid JSON response from file tool"}
+                if not isinstance(d, dict):
+                    d = {"error": "file-tool response must be an object"}
+                if "error" not in d and not isinstance(d.get(list_key), list):
+                    d = {**d, "error": f"file-tool response has no valid {list_key} list"}
+                record = {
+                    "repo": name, "repo_index": index,
+                    "status": "error" if "error" in d else "ok",
+                    "metadata": {k: v for k, v in d.items() if k != list_key},
+                }
+                repo_results.append(record)
+                if "error" in d:
+                    record["error"] = str(d["error"])
+                    if first_error is None:
+                        first_error = d
+                    continue
+                saw_ok = True
+                merged[list_key].extend(d[list_key])
+                merged["truncated"] = merged["truncated"] or bool(d.get("truncated"))
+                if list_key == "matches":
+                    merged["deduped"] += int(d.get("deduped", 0) or 0)
+            if not saw_ok and first_error is not None:
+                return json.dumps({**first_error, "repo_results": repo_results}, ensure_ascii=False)
+            if first_error is not None:
+                merged["partial"] = True
+                merged["warning"] = (
+                    "Some repository file queries failed; these results cover only successful "
+                    "repositories. An empty result does not prove there are no matching files or text."
+                )
+            merged["repo_results"] = repo_results
+            merged["count"] = len(merged[list_key])
+            return json.dumps(merged, ensure_ascii=False)
+
+        def _safe_file_call(fn, repo_name: str, what: str):
+            """Run one repo's file-tool call inside the fan-out, isolating its failure into
+            an error envelope (mirrors the graph fan-out's _run_on_repo). Without this, one
+            repo raising would abort the whole list comprehension and blank the HEALTHY repos'
+            results — violating "one repo's error must not blank the others"."""
+            try:
+                return fn()
+            except ValueError as exc:
+                # Recoverable input error (bad pattern) — echoes only agent input, safe.
+                return json.dumps({"error": f"bad {what} pattern", "detail": str(exc)})
+            except Exception as exc:  # noqa: BLE001 - isolate one repo's failure
+                # str(exc) may carry a host path → log it, return a generic detail only.
+                logger.error(json.dumps({"event": f"{what}_error", "repo": repo_name, "error": str(exc)}))
+                return json.dumps({"error": f"{what} failed on {repo_name}",
+                                   "detail": "internal error (see service logs)"})
+
+        async def codegraph_search_files(pattern: str, glob: str | None = None, repo: str | None = None) -> str:
+            """Fast text search across the codebase (paths returned repo-relative,
+            e.g. `Assets/Scripts/Foo.cs`; multi-repo prefixes them `<repo>/...`). `pattern`
+            is a regex; optional `glob` narrows by filename (e.g. "*.cs", "*.json"); optional
+            `repo` scopes to one repo (omit to search ALL repos in the project). Use this
+            instead of shell grep. Unicode regex requires ripgrep on the index host.
+            If unavailable, grep uses byte-oriented POSIX ERE: "." matches one byte,
+            and CJK character ranges are unsupported. Use literal keywords in that
+            degraded mode; /health reports whether ripgrep is available."""
+            def run() -> str:
+                targets = _file_targets(repo)
+                if len(targets) == 1:
+                    t = targets[0]
+                    return file_search.search_to_json(pattern, local_root=t.local, glob=glob, repo=t.name)
+                # FAN-OUT: each repo isolated via _safe_file_call so one repo's failure can't
+                # blank the others; the merge records failures and marks partial coverage.
+                per_repo = [
+                    _safe_file_call(
+                        lambda t=t: file_search.search_to_json(pattern, local_root=t.local, glob=glob, repo=t.name),
+                        t.name, "search")
+                    for t in targets
+                ]
+                return _merge_file_fanout("matches", per_repo, [t.name for t in targets])
+            return _guarded(run, bad_input="bad search pattern", failed="search failed",
+                            log_event="search_error", scope_warn_tool="search_files")
+
+        async def codegraph_read_file(path: str, offset: int = 0, limit: int | None = None,
+                                      line: int | None = None) -> str:
+            """Read a source/config file's contents by its path (the path codegraph/search
+            returns, e.g. `Assets/Scripts/Foo.cs` or `<repo>/Assets/Scripts/Foo.cs` —
+            pass it back verbatim). To re-read a line codegraph_search_files reported, pass
+            `line=<its line value>`: `line` is 1-BASED and needs no adjustment, which is
+            how you confirm a citation points at the text you are about to quote.
+            Optional `offset` (0-based line) + `limit` page large
+            files; `offset` can point ANYWHERE in the file (not just the first ~256 KiB).
+            The result includes `total_lines` and, when `truncated` is true, `next_offset` —
+            call again with `offset=next_offset` to read the next contiguous window (repeat
+            until `truncated` is false). Prefer this for reading a long contiguous run (e.g. a
+            whole config/data table) rather than many narrow searches. Use this instead of a
+            shell `cat` or builtin Read."""
+            def run() -> str:
+                t = _repo_for_path(path, None)
+                return file_read.read_to_json(path, local_root=t.local, offset=offset,
+                                              limit=limit, repo=t.name, line=line)
+            return _guarded(run, bad_input="cannot read file", failed="read failed",
+                            log_event="read_error")
+
+        async def codegraph_glob_files(pattern: str, repo: str | None = None) -> str:
+            """List files matching a glob `pattern` (e.g. "**/*.cs", "Config/*.json"),
+            interpreted relative to the repo root. Returns paths in the agent's namespace
+            (multi-repo prefixes them `<repo>/...`). Optional `repo` scopes to one repo
+            (omit to glob ALL repos). Use this instead of a shell `ls`/`find` or builtin Glob."""
+            def run() -> str:
+                targets = _file_targets(repo)
+                if len(targets) == 1:
+                    t = targets[0]
+                    return file_read.glob_to_json(pattern, local_root=t.local, repo=t.name)
+                # FAN-OUT: per-repo isolation so one repo's failure can't blank the others.
+                per_repo = [
+                    _safe_file_call(
+                        lambda t=t: file_read.glob_to_json(pattern, local_root=t.local, repo=t.name),
+                        t.name, "glob")
+                    for t in targets
+                ]
+                return _merge_file_fanout("paths", per_repo, [t.name for t in targets])
+            return _guarded(run, bad_input="bad glob pattern", failed="glob failed",
+                            log_event="glob_error", scope_warn_tool="glob_files")
+
+        async def codegraph_read_table(path: str) -> str:
+            """Read a STRUCTURED config table that read_file can't (Excel .xlsx,
+            .csv, .tsv, or a SQLite .db) — parsed server-side into plain text rows.
+            The legacy binary .xls is NOT supported (re-save as .xlsx).
+            Pass the path verbatim (a `<repo>/...` prefix is fine). Use this when the data
+            lives in a spreadsheet/database config file (common for game numeric tables);
+            for plain-text source/config use read_file."""
+            def run() -> str:
+                t = _repo_for_path(path, None)
+                return file_table.read_table_to_json(path, local_root=t.local, repo=t.name)
+            return _guarded(run, bad_input="cannot read table", failed="read table failed",
+                            log_event="read_table_error")
+
+        # Ship the FULL docstrings as the tool description (FastMCP uses `description or
+        # __doc__`, so passing a terse description= DROPS the docstring the model needs to
+        # disambiguate the tools). Per Anthropic "writing tools for agents": the description
+        # is the primary signal the model uses to pick + call a tool correctly.
+        app.add_tool(codegraph_search_files, name="codegraph_search_files",
+                     description=(codegraph_search_files.__doc__ or "").strip(),
+                     annotations=READONLY_ANNOT)
+        app.add_tool(codegraph_read_file, name="codegraph_read_file",
+                     description=(codegraph_read_file.__doc__ or "").strip(),
+                     annotations=READONLY_ANNOT)
+        app.add_tool(codegraph_glob_files, name="codegraph_glob_files",
+                     description=(codegraph_glob_files.__doc__ or "").strip(),
+                     annotations=READONLY_ANNOT)
+        app.add_tool(codegraph_read_table, name="codegraph_read_table",
+                     description=(codegraph_read_table.__doc__ or "").strip(),
+                     annotations=READONLY_ANNOT)
+
+        logger.info(json.dumps({"event": "search_tool_enabled", "repos": [r.name for r in repos],
+                                "file_tools": ["codegraph_search_files", "codegraph_read_file",
+                                               "codegraph_glob_files", "codegraph_read_table"]}))
+    else:
+        logger.warning(json.dumps({"event": "search_tool_disabled",
+                                   "reason": "a served repo has no local copy on disk",
+                                   "repos": [{"name": r.name, "local": r.local} for r in repos]}))
+
+    # --- glossary (Chinese-term -> code-symbol bridge) -------------------------------
+    # TOP-LEVEL (not nested under file_repos_ok): the glossary is per-project data at
+    # /data/glossary/<project>/, a path INDEPENDENT of the repo code copies — so a missing repo
+    # copy (which disables the file tools above) must NOT also disable the glossary. Registered
+    # only when a project id is known. Both tools are READ-ONLY and confined inside glossary_read
+    # (project-name whitelist + realpath); they belong in this closed allowlist like the file tools.
+    if project:
+        import glossary_read
+
+        async def glossary_index() -> str:
+            """List this project's term index: Chinese/colloquial terms planners use
+            (e.g. 战力, 爆率, 体力) mapped to the ENGLISH code symbols they appear as
+            (combatPower, loot_chance, maxStamina). When the user asks in Chinese and you're
+            unsure which symbol to search, look up their wording here to get the code symbols
+            to search for. Each row is {concept_id, aliases, symbols}; for a concept's full
+            symbol set + source anchors (file:line), call glossary_lookup. The index is a
+            derived hint built from the code — always confirm against real code."""
+            return _guarded(lambda: glossary_read.index_to_json(project),
+                            bad_input="glossary unavailable", failed="glossary index failed",
+                            log_event="glossary_index_error",
+                            fallback=json.dumps({"concepts": []}))
+
+        async def glossary_lookup(query: str) -> str:
+            """Look up a concept in the term index — by `concept_id` (from glossary_index)
+            OR directly by a Chinese/colloquial word the user said (e.g. "战力", "爆率").
+            Returns code symbols, aliases, confidence, and source anchors (file:line) for
+            verification — including lower-confidence concepts glossary_index omits.
+            RETURN SHAPE (three cases): exactly ONE match -> a flat record
+            {concept_id, symbols, aliases, confidence, anchors[, repo]}; SEVERAL matches ->
+            {"matches": [ ...those records... ]}; NONE / empty query -> {"error": ...}. In a
+            multi-repo project concept_id is namespaced "<repo>/<id>" and each record carries
+            `repo`. Read symbols from the record (single) or from each matches[] entry, then
+            search them in real code."""
+            return _guarded(lambda: glossary_read.lookup_to_json(project, query),
+                            bad_input="glossary unavailable", failed="glossary lookup failed",
+                            log_event="glossary_lookup_error",
+                            fallback=json.dumps({"error": "glossary lookup failed"}))
+
+        app.add_tool(glossary_index, name="codegraph_glossary_index",
+                     description=(glossary_index.__doc__ or "").strip(),
+                     annotations=READONLY_ANNOT)
+        app.add_tool(glossary_lookup, name="codegraph_glossary_lookup",
+                     description=(glossary_lookup.__doc__ or "").strip(),
+                     annotations=READONLY_ANNOT)
+        logger.info(json.dumps({"event": "glossary_tools_enabled", "project": project}))
+
+    # Plain HTTP /health so deploy orchestration (and load balancers) can poll
+    # readiness: 200 only once the graph warmed up non-empty, 503 otherwise.
+    # Registered unconditionally — if this fails the bridge is misbuilt and we
+    # want it to fail loudly at startup, not silently 404 and cause an opaque
+    # 8-minute health-wait timeout in deploy. (starlette ships with uvicorn.)
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    # Registered by the decorator and called by Starlette's HTTP router.
+    # nosemgrep: useless-inner-function
+    @app.custom_route("/health", methods=["GET"])
+    async def _health(_req: Request) -> JSONResponse:  # pragma: no cover - thin
+        # Autonomous recovery: heal a dead/wedged worker on a health poll, so an
+        # IDLE instance (no user traffic) recovers without waiting for a query —
+        # otherwise a health-gated load balancer would see 503 forever. Single-
+        # flight + best-effort (never raises); a no-op when the worker is healthy.
+        # MULTI-REPO: heal EVERY repo's session and treat the bridge as healthy only
+        # when ALL repos are healthy (one repo's empty/corrupt graph = degraded bridge;
+        # the agent could otherwise answer "not found" off a broken repo). The detail
+        # names the first unhealthy repo so ops can pinpoint which graph is down.
+        for r in repos:
+            await r.session.maybe_self_heal()
+        unhealthy = [r for r in repos if not r.session.healthy]
+        ok = not unhealthy
+        if unhealthy:
+            first = unhealthy[0]
+            detail = (f"{len(unhealthy)}/{len(repos)} repo(s) unhealthy; "
+                      f"first: {first.name}: {first.session.health_detail}")
+        else:
+            detail = session.health_detail
+        # LOCAL repo read probe — A HEALTH GATE, not just telemetry. The agent reads
+        # source over THIS bridge (read_file/glob_files/search_files) off the local
+        # repo copy. codegraph answers from its IN-MEMORY graph (session.healthy
+        # stays true) even if the on-disk copy becomes unreadable (disk fault, the
+        # extract dir got wiped) — but then every agent file read fails and the user
+        # gets a broken answer while /health lied 200. So a probe FAILURE flips
+        # /health to unhealthy. A consecutive-fail counter avoids flapping on a
+        # single transient error. Probes EACH repo's local copy (file tools read off it);
+        # any one unreadable flips the bridge unhealthy. Falls back to the indexed
+        # workspace when a repo has no separate local copy (same path post-EFS-removal).
+        disk_ms = -1.0
+        probe_ok = True
+        try:
+            import os
+            import time as _t
+            t0 = _t.perf_counter()
+            total_entries = 0
+            empty_repos: list[str] = []
+            for r in repos:
+                pr = r.local or r.workspace
+                entries = os.listdir(pr)  # 1 metadata read per repo
+                total_entries += len(entries)
+                if entries:
+                    os.stat(os.path.join(pr, entries[0]))  # stat read
+                else:
+                    # An EMPTY directory used to count as a successful probe. That is exactly the
+                    # shape of "repo copy wiped" and "local repo before its first push", both of
+                    # which end with the bot answering 'not found' while /health stays green.
+                    empty_repos.append(getattr(r, "name", pr))
+            disk_ms = round((_t.perf_counter() - t0) * 1000, 1)
+            if empty_repos:
+                logger.warning(json.dumps({
+                    "event": "repo_probe_empty", "repos": empty_repos,
+                    "detail": "repo copy has no files on disk — the graph will be empty and every "
+                              "answer will be an honest 'not found'. For a local-repo project this "
+                              "is expected until the first push.",
+                }))
+            logger.info(json.dumps({"event": "repo_probe", "perf": True,
+                                    "empty_repos": empty_repos,
+                                    "latency_ms": disk_ms, "entries": total_entries,
+                                    "repos": len(repos)}))
+        except Exception as exc:  # noqa: BLE001
+            probe_ok = False
+            logger.warning(json.dumps({"event": "repo_probe_failed", "error": str(exc)}))
+        # Track consecutive failures on the app object (survives across requests).
+        # CONCURRENCY: this read-modify-write is NOT guarded by a lock, and is safe ONLY
+        # because the bridge runs a SINGLE uvicorn worker = ONE event loop, and there is
+        # NO `await` between the read and the write below (the only await in this handler
+        # is maybe_self_heal() far above). Concurrent stateless_http handlers are asyncio
+        # tasks on that one loop; without an await between them they cannot interleave, so
+        # the RMW is effectively atomic (cross-review flagged a race assuming truly-parallel
+        # handlers — there aren't any here). If a future change adds an await between these
+        # lines, or moves the bridge to threaded/multi-worker serving, guard this with a
+        # lock. (Same single-loop assumption the CodegraphSession single-writer rests on.)
+        fails = getattr(app, "_repo_probe_fails", 0)
+        fails = 0 if probe_ok else fails + 1
+        app._repo_probe_fails = fails  # type: ignore[attr-defined]
+        repo_down = fails >= 2  # two strikes → treat repo as unreadable (avoid single-blip flap)
+        if repo_down:
+            ok = False
+            detail = f"repo copy unreadable ({fails} consecutive probe failures): {detail}"
+        # OBSERVABILITY (does NOT gate health — a 200/503 flip on either of these would be worse
+        # than the blind spot it closes):
+        #  * ripgrep: bootstrap installs `rg` with a `|| true`, so a failed install silently
+        #    degrades search_files to the grep fallback with nothing anywhere reporting it.
+        #  * code_stale: a re-bootstrap refreshes /opt/idx/app UNDER the running bridge without
+        #    restarting it, so the process can be executing code older than what is on disk. This
+        #    compares the app bundle's signature stamp now against the value read at startup. It is
+        #    a NO-OP until the bootstrap side stamps the file — reporting False either way is
+        #    correct (nothing observed changing), so it is safe to ship ahead of that.
+        rg_ok = shutil.which("rg") is not None
+        return JSONResponse(
+            {"healthy": ok, "detail": detail, "repo_probe_ms": disk_ms,
+             "ripgrep": rg_ok, "code_stale": _app_code_changed()},
+            status_code=200 if ok else 503,
+        )
+
+    # Start EACH repo's resident codegraph worker now, so it's running on EVERY serving
+    # path (main() and tests alike) — not only when main() remembers to start it.
+    # FastMCP's `lifespan=` is the MCP-session lifespan, NOT the ASGI startup
+    # hook, so starting there never fired under the real server. Each worker owns
+    # its own thread + event loop, so start() is safe here (returns immediately, warms
+    # the graph in the background) and is idempotent.
+    for r in repos:
+        r.session.start()
+
+    # Expose the sessions so callers can inspect health / stop them. `codegraph_session`
+    # is the PRIMARY (back-compat: existing tests/inspection use it); `codegraph_sessions`
+    # is the full list for multi-repo callers.
+    app.codegraph_session = primary.session  # type: ignore[attr-defined]
+    app.codegraph_sessions = [r.session for r in repos]  # type: ignore[attr-defined]
+    app.codegraph_repos = repos  # type: ignore[attr-defined]
+    return app
+
+
+def pair_workspaces(workspace: list[str], local_workspace: list[str]) -> list[tuple[str, str | None]]:
+    """Pair repeatable --workspace with --local-workspace BY POSITION → build_bridge input.
+
+    Pure (no I/O) so it's unit-testable. Each --workspace[i] pairs with --local-workspace[i];
+    a missing local (fewer --local-workspace than --workspace) → None for that repo. Rules:
+      - at least one --workspace (fail-loud — a bridge with no repo is a deploy error);
+      - --local-workspace count must not EXCEED --workspace count (a stray local with no
+        matching workspace is a config mistake, not silently dropped);
+      - duplicate workspace paths are rejected (two sessions on one graph.db → corruption).
+    """
+    if not workspace:
+        raise ValueError("at least one --workspace is required")
+    if len(local_workspace) > len(workspace):
+        raise ValueError(
+            f"--local-workspace given {len(local_workspace)}x but only {len(workspace)} "
+            f"--workspace; each local pairs with a workspace by position")
+    seen: set[str] = set()
+    pairs: list[tuple[str, str | None]] = []
+    for i, ws in enumerate(workspace):
+        key = ws.rstrip("/")
+        if key in seen:
+            raise ValueError(f"duplicate --workspace {ws!r} (two sessions on one graph.db → corruption)")
+        seen.add(key)
+        local = local_workspace[i] if i < len(local_workspace) else None
+        pairs.append((ws, local))
+    return pairs
+
+
+def build_asgi_app(bridge: FastMCP) -> "Any":
+    """Turn a built bridge into the ASGI app that gets SERVED, with the peer guard attached.
+
+    THE ONLY PLACE that produces a servable app, deliberately. `app.run()` is expanded into what
+    FastMCP's own run_streamable_http_async does — streamable_http_app() + uvicorn.Config with the
+    same host/port/log_level — so that one ASGI middleware can be wrapped around it.
+
+    WHY THIS IS A FUNCTION and not four lines inside main(). This bridge has TWO
+    network-position controls and they were attached at different depths: the single-writer flock
+    in build_bridge(), the peer check inline in main(). Automated review pointed out that the two
+    then disagree on exactly the entry point the flock's own comment says it defends — an
+    app-factory launch. Whichever entry point is added next, calling this function is what makes
+    the peer check come along; reaching past it to streamable_http_app() is then a visible,
+    deliberate bypass rather than something forgotten.
+
+    (On that app-factory launch: as of today it does NOT exist. There is no module-level `app`, so
+    `gunicorn http_bridge:app` fails with AttributeError — the flock comments describing it were
+    describing a path that was never wired up. They are corrected in place rather than left
+    asserting a defence of something absent. Keeping the flock in build_bridge() is still right:
+    it guards EVERY caller of build_bridge, including tests and any future entry point.)
+
+    PEER-ADDRESS ADMISSION CHECK (AppSec finding 608d4a22). This is the SECOND enforcement point
+    for a bridge whose only control was the security group: loopback and private peers pass (the
+    health probe, the AgentCore runtime, an in-VPC load balancer), anything else gets 403. It is
+    authorization by network position, not authentication — see peer_guard.py.
+    BRIDGE_ALLOW_ANY_PEER=1 disables it for a topology that fronts the bridge from outside the VPC.
+    """
+    from peer_guard import PeerGuardMiddleware, allow_any_peer
+
+    starlette_app = bridge.streamable_http_app()
+    if allow_any_peer():
+        logger.warning(json.dumps({
+            "event": "bridge_peer_guard_disabled",
+            "detail": "BRIDGE_ALLOW_ANY_PEER is set: the in-process peer check is OFF and the "
+                      "security group is again the only control on an unauthenticated "
+                      "source-read API.",
+        }))
+    else:
+        # add_middleware wraps OUTSIDE anything streamable_http_app() installed, so the peer
+        # decision happens before session handling or auth — which is where it belongs.
+        starlette_app.add_middleware(PeerGuardMiddleware)
+    return starlette_app
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    # Repeatable for multi-repo: one --workspace per repo this bridge serves, each paired
+    # BY POSITION with a --local-workspace. Single-repo passes one of each (unchanged).
+    p.add_argument("--workspace", action="append", default=[],
+                   help="repo path codegraph-server indexes (repeat for multi-repo)")
+    # SAFE-BY-DEFAULT BIND. There is NO authentication on this server: anything that can reach the
+    # port can read any indexed source (read_file / glob_files / search_files) and enumerate the
+    # graph, so the only control is the network. The DEFAULT is therefore loopback; the deployed
+    # unit (activate_project.sh) passes --host 0.0.0.0 explicitly because the AgentCore runtime
+    # connects over the VPC by private IP and the loopback /health probe must keep working — that
+    # exposure is a reviewed, recorded decision there, not something a caller should inherit by
+    # forgetting the flag. Adding real auth needs a matching change in the agent's MCP client.
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8080)
+    # DEPRECATED, accepted-but-ignored: paths are always repo-relative now (the agent
+    # mounts no filesystem). The deploy script (activate_project.sh) still passes
+    # --mount-root "" on existing installs, so removing the flag outright would break
+    # startup; keep parsing it, warn when given, and never use it.
+    p.add_argument("--mount-root", default=None,
+                   help="DEPRECATED: ignored (paths are always repo-relative)")
+    p.add_argument("--local-workspace", action="append", default=[],
+                   help="local-disk copy for fast file search; pairs with --workspace by position "
+                        "(grep over EFS is ~225x slower). Repeat for multi-repo.")
+    p.add_argument("--project", default=None,
+                   help="project id (^[a-z0-9-]+$); enables the per-project glossary tools "
+                        "reading /data/glossary/<project>/. Omit to disable the glossary.")
+    args = p.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    if args.mount_root is not None:
+        logger.warning(json.dumps({"event": "bridge_deprecated_flag", "flag": "--mount-root",
+                                   "value": args.mount_root,
+                                   "detail": "--mount-root is deprecated and ignored; "
+                                             "paths are always repo-relative"}))
+
+    try:
+        pairs = pair_workspaces(args.workspace, args.local_workspace)
+    except ValueError as exc:
+        logger.error(json.dumps({"event": "bridge_bad_args", "detail": str(exc)}))
+        return 2
+
+    # SINGLE-WRITER HARD GUARD — take EACH workspace flock early so a conflict exits
+    # cleanly (return 1) before any worker work. build_bridge() re-calls these (idempotent
+    # per workspace) so an app-factory launch that bypasses main() is still guarded.
+    try:
+        for ws, _local in pairs:
+            acquire_singleton_writer_lock(ws)
+    except SingleWriterConflict:
+        return 1  # the helper already logged bridge_singleton_conflict
+
+    logger.info(json.dumps({"event": "bridge_start",
+                            "workspaces": [ws for ws, _ in pairs],
+                            "host": args.host, "port": args.port}))
+    # Make the unauthenticated-exposure decision VISIBLE in the journal on every start, so it shows
+    # up in an incident timeline instead of only in a unit file comment. Not an error: the deployed
+    # configuration binds all interfaces on purpose (see --host above) and relies on the security
+    # group. A host reachable from outside the VPC with this line in its log is a finding.
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        logger.warning(json.dumps({
+            "event": "bridge_unauthenticated_bind", "host": args.host, "port": args.port,
+            "detail": "no authentication on this server: source read access is limited only by "
+                      "network reachability (security group). Intended for in-VPC access from "
+                      "the AgentCore runtime.",
+        }))
+    # build_bridge starts each repo's resident worker (warming in background).
+    app = build_bridge(
+        workspaces=pairs, host=args.host, port=args.port,
+        project=args.project,
+    )
+    import uvicorn
+
+    # build_asgi_app is the single place that attaches the peer guard — see its docstring for why
+    # this is a function rather than four lines here.
+    uvicorn.Server(uvicorn.Config(
+        build_asgi_app(app), host=args.host, port=args.port, log_level="info",
+    )).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

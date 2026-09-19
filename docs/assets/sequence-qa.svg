@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="648" viewBox="0 0 760 648" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5b6573"/>
+    </marker>
+    <marker id="arrowback" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3b7d4f"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="760" height="648" fill="#ffffff"/>
+  <text x="380" y="32" text-anchor="middle" font-size="18" font-weight="700" fill="#1f2733">一次问答的端到端时序</text>
+  <text x="380" y="54" text-anchor="middle" font-size="12.5" fill="#7a8493">实线 = 请求 · 绿线 = 流式回填 · 自上而下按时间推进</text>
+
+  <!-- lifelines: 6 actors. x centers: 56, 172, 300, 424, 548, 692 -->
+  <g font-size="11" font-weight="600" fill="#1f2733" text-anchor="middle">
+    <rect x="12" y="72" width="88" height="40" rx="7" fill="#f1f3f7" stroke="#cdd5e0"/>
+    <text x="56" y="91">飞书客户端</text><text x="56" y="105" font-size="9" font-weight="400" fill="#7a8493">策划 @机器人</text>
+
+    <rect x="122" y="72" width="100" height="40" rx="7" fill="#fdf5e9" stroke="#e4c896"/>
+    <text x="172" y="91">飞书开放平台</text><text x="172" y="105" font-size="9" font-weight="400" fill="#7a8493">事件订阅 · 中转</text>
+
+    <rect x="248" y="72" width="104" height="40" rx="7" fill="#eef3fb" stroke="#b9c9e6"/>
+    <text x="300" y="91">bot-gateway</text><text x="300" y="105" font-size="9" font-weight="400" fill="#7a8493">长连接 · 路由</text>
+
+    <rect x="374" y="72" width="100" height="40" rx="7" fill="#eef3fb" stroke="#b9c9e6"/>
+    <text x="424" y="91">AgentCore</text><text x="424" y="105" font-size="9" font-weight="400" fill="#7a8493">microVM Agent</text>
+
+    <rect x="494" y="72" width="108" height="40" rx="7" fill="#eef6ef" stroke="#9cc6a8"/>
+    <text x="548" y="91">index-service</text><text x="548" y="105" font-size="9" font-weight="400" fill="#7a8493">查证 · 读文件</text>
+
+    <rect x="646" y="72" width="92" height="40" rx="7" fill="#fdf5e9" stroke="#e4c896"/>
+    <text x="692" y="91">CardKit</text><text x="692" y="105" font-size="9" font-weight="400" fill="#7a8493">开放平台·流式卡片</text>
+  </g>
+
+  <!-- lifelines -->
+  <g stroke="#dfe4ea" stroke-width="1.2" stroke-dasharray="3,4">
+    <line x1="56" y1="112" x2="56" y2="578"/>
+    <line x1="172" y1="112" x2="172" y2="578"/>
+    <line x1="300" y1="112" x2="300" y2="578"/>
+    <line x1="424" y1="112" x2="424" y2="578"/>
+    <line x1="548" y1="112" x2="548" y2="578"/>
+    <line x1="692" y1="112" x2="692" y2="578"/>
+  </g>
+
+  <!-- messages -->
+  <g font-size="10" fill="#3b4654">
+    <!-- 1 client -> open platform -->
+    <line x1="56" y1="140" x2="170" y2="140" stroke="#5b6573" stroke-width="1.3" marker-end="url(#arrow)"/>
+    <text x="114" y="134" text-anchor="middle">① @机器人提问</text>
+
+    <!-- 2 open platform -> gateway (long-conn push) -->
+    <line x1="172" y1="170" x2="298" y2="170" stroke="#5b6573" stroke-width="1.3" marker-end="url(#arrow)"/>
+    <text x="236" y="164" text-anchor="middle">② 长连接推送事件</text>
+
+    <!-- 3 gateway -> CardKit: create card -->
+    <line x1="300" y1="198" x2="690" y2="198" stroke="#5b6573" stroke-width="1.3" marker-end="url(#arrow)"/>
+    <text x="496" y="192" text-anchor="middle">③ 建卡「正在分析…」（拿 card_id）</text>
+
+    <!-- card visible back to client (through Feishu) -->
+    <line x1="690" y1="224" x2="58" y2="224" stroke="#3b7d4f" stroke-width="1.3" marker-end="url(#arrowback)"/>
+    <text x="374" y="218" text-anchor="middle" fill="#2f7a47">卡片即时可见 · 带实时计时（经飞书推送）</text>
+
+    <!-- 4 gateway -> AgentCore: invoke -->
+    <line x1="300" y1="256" x2="422" y2="256" stroke="#5b6573" stroke-width="1.3" marker-end="url(#arrow)"/>
+    <text x="361" y="250" text-anchor="middle">④ SigV4 invoke</text>
+
+    <!-- 5 glossary (auxiliary, not a mandatory serial gate — dashed) -->
+    <line x1="424" y1="286" x2="546" y2="286" stroke="#9aa3b0" stroke-width="1.3" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+    <text x="485" y="280" text-anchor="middle" fill="#7a8493">⑤ 查术语表（辅助·命中中文词才查）</text>
+    <line x1="548" y1="310" x2="426" y2="310" stroke="#9aa3b0" stroke-width="1.3" stroke-dasharray="4,3" marker-end="url(#arrowback)"/>
+    <text x="487" y="304" text-anchor="middle" fill="#7a8493">中文 → 英文符号（与自有检索词并用）</text>
+
+    <!-- 6 locate -->
+    <line x1="424" y1="340" x2="546" y2="340" stroke="#5b6573" stroke-width="1.3" marker-end="url(#arrow)"/>
+    <text x="485" y="334" text-anchor="middle">⑥ CodeGraph 定位</text>
+    <line x1="548" y1="364" x2="426" y2="364" stroke="#3b7d4f" stroke-width="1.3" marker-end="url(#arrowback)"/>
+    <text x="487" y="358" text-anchor="middle" fill="#2f7a47">命中的文件</text>
+
+    <!-- 7 read -->
+    <line x1="424" y1="394" x2="546" y2="394" stroke="#5b6573" stroke-width="1.3" marker-end="url(#arrow)"/>
+    <text x="485" y="388" text-anchor="middle">⑦ 精准读文件</text>
+    <line x1="548" y1="418" x2="426" y2="418" stroke="#3b7d4f" stroke-width="1.3" marker-end="url(#arrowback)"/>
+    <text x="487" y="412" text-anchor="middle" fill="#2f7a47">真实代码内容</text>
+
+    <!-- loop note over 5-7 -->
+    <rect x="437" y="274" width="18" height="162" rx="3" fill="none" stroke="#c7ccd4" stroke-width="1" stroke-dasharray="2,3"/>
+    <text x="486" y="434" text-anchor="middle" font-size="9" fill="#9aa3b0">按需多轮</text>
+
+    <!-- 8 stream back -->
+    <line x1="422" y1="456" x2="302" y2="456" stroke="#3b7d4f" stroke-width="1.3" marker-end="url(#arrowback)"/>
+    <text x="362" y="450" text-anchor="middle" fill="#2f7a47">⑧ 流式产出（SSE：结论先行）</text>
+
+    <!-- 9 update card -->
+    <line x1="300" y1="484" x2="690" y2="484" stroke="#3b7d4f" stroke-width="1.3" marker-end="url(#arrowback)"/>
+    <text x="496" y="478" text-anchor="middle" fill="#2f7a47">⑨ 流式更新卡片</text>
+
+    <!-- card refreshes on client, through Feishu -->
+    <line x1="690" y1="510" x2="58" y2="510" stroke="#3b7d4f" stroke-width="1.3" marker-end="url(#arrowback)"/>
+    <text x="374" y="504" text-anchor="middle" fill="#2f7a47">卡片在客户端边写边刷新（经飞书推送）</text>
+
+    <!-- 10 finalize -->
+    <line x1="300" y1="538" x2="690" y2="538" stroke="#3b7d4f" stroke-width="1.3" marker-end="url(#arrowback)"/>
+    <text x="496" y="532" text-anchor="middle" fill="#2f7a47">⑩ 收尾：「供研发复核」+ 追问按钮</text>
+
+    <!-- finished card back to client -->
+    <line x1="690" y1="564" x2="58" y2="564" stroke="#3b7d4f" stroke-width="1.3" marker-end="url(#arrowback)"/>
+    <text x="374" y="558" text-anchor="middle" fill="#2f7a47">成品卡片 · 可继续追问（经飞书推送）</text>
+  </g>
+
+  <text x="380" y="600" text-anchor="middle" font-size="10.5" fill="#7a8493">全程只读、读代码核对 · 会话 microVM 不挂仓库文件系统 · 工作原理见 docs/agent/architecture.md</text>
+</svg>

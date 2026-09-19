@@ -1,0 +1,539 @@
+"""CLI entry: (re)build a project's glossary on the index host.
+
+Wires the pieces in glossary_build + glossary into a single command the
+activate_project / index-refresh units invoke. Two modes:
+
+  full         scan the whole repo with cc (first activation / fallback)
+  incremental  scan only the changed files (the default on refresh)
+
+Usage:
+  python3 -m glossary_gen --project <id> --repo-root <dir> --out <entries.jsonl> \
+      --model <bedrock-model-id> --region <r> \
+      [--old <sha> --new <sha>] [--changed-list <f> --deleted-list <f>] [--full]
+
+The incremental change set comes from one of two sources:
+  - git repos: --old/--new shas (git_fetch records them around its reset); the diff is
+    computed here via `git diff`, so this script stays self-contained.
+  - local repos (no git): --changed-list / --deleted-list files of repo-relative paths,
+    derived by reindex_local_repo.sh from the rsync that applied the pushed snapshot.
+Either source feeds the SAME merge (merge_incremental); only where the path set comes
+from differs.
+
+TOKEN FRUGALITY: incremental hands cc only the changed files; an EMPTY change set exits 0
+WITHOUT calling cc (nothing to do). On first build (no change source, or --full) it does
+a full scan.
+
+EXIT CODES: 0 ok (incl. no-op empty diff); 2 bad args / unusable repo. A cc failure
+during refresh is logged and treated as a SKIP (keep the existing glossary) — never
+blank a working index on a transient build error; --strict makes it fatal instead.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import glossary
+import glossary_build
+import glossary_config
+from glossary_source import open_source, source_path
+import served_paths
+
+logger = logging.getLogger("glossary-gen")
+
+# Files whose changes can't yield code symbols / domain terms — skip to save cc tokens.
+_SKIP_PREFIXES = (".git/", "node_modules/", ".venv/")
+
+# Scan ALL text files — code/config AND docs (README/design notes/wiki/plain text), since the
+# Chinese terms that bridge to code often live in docs. We do NOT allowlist extensions (that would
+# "limit file types"); instead we EXCLUDE known binary/asset extensions (can't extract terms from a
+# PNG, and feeding binary to cc wastes tokens). Doc-sourced terms are demoted in confidence at
+# extract time (glossary.is_code_source / demote_confidence) so code stays authoritative.
+_BINARY_EXTS = (
+    # images / media
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp", ".tga", ".dds",
+    ".psd", ".mp3", ".wav", ".ogg", ".mp4", ".mov", ".avi", ".webm", ".ttf", ".otf", ".woff", ".woff2",
+    # archives / binaries
+    ".zip", ".gz", ".tar", ".7z", ".rar", ".bin", ".exe", ".dll", ".so", ".dylib", ".a", ".o",
+    ".class", ".jar", ".pyc", ".wasm", ".pdf", ".db", ".sqlite", ".lock",
+    ".pdb", ".lib", ".obj", ".pch", ".idb", ".ilk", ".bsc", ".res", ".mdb",
+    # game/binary asset blobs
+    ".dbc", ".m2", ".blp", ".mdx", ".unity3d", ".asset", ".fbx", ".prefab",
+)
+# Optional cap on files handed to cc in ONE build. DEFAULT 0 = NO CAP (scan the whole candidate
+# set) — a 400-file cap truncated by path order dropped the Chinese-dense files (config tables,
+# deep business code), leaving a glossary with 0 Chinese terms; the whole point of the glossary is
+# 中文→英文符号, so full coverage is the right default. Cost scales with file count (order of $10
+# per few hundred files on a large Chinese game repo, more for a full scan).
+# Overridable per project: env GLOSSARY_MAX_FILES, or --max-files (flag wins). Set a positive value
+# to cap coverage and save Bedrock cost; 0/negative means "no cap" (whole candidate set).
+MAX_BUILD_FILES = int(os.environ.get("GLOSSARY_MAX_FILES", "0") or "0")
+
+
+def _is_term_file(path: str) -> bool:
+    # A term-bearing (text) file = NOT a known binary/asset. Case-insensitive. Note: .db/.sqlite
+    # are excluded here (binary) — structured config tables go through read_table, not cc text scan.
+    return not path.lower().endswith(_BINARY_EXTS)
+
+
+def candidate_files(repo_root: str) -> list[str]:
+    """Repo-relative text files for a FULL scan — bounds 'full' to text files (excludes binary/
+    asset blobs) instead of letting cc roam the whole tree. Skips VCS/vendored dirs. Sorted +
+    capped at MAX_BUILD_FILES (the drop is logged by the caller, never silent)."""
+    import os
+    root = os.path.realpath(repo_root)
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # .home / .codegraph MUST be pruned: http_bridge sets HOME=<workspace>/.home, which puts the
+        # RocksDB graph store INSIDE the very tree being scanned, and its files (.sst, .log,
+        # MANIFEST-*, CURRENT, OPTIONS-*, LOCK) are not in _BINARY_EXTS. Without this, a full build
+        # feeds hundreds of megabytes of binary graph data to the model — burning cost on content
+        # that can never yield a glossary term, and shipping internal index state into a prompt.
+        dirnames[:] = [
+            d for d in dirnames
+            if not served_paths.is_withheld(d)
+        ]
+        for fn in filenames:
+            if not _is_term_file(fn):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, fn), root)
+            try:
+                with open_source(Path(root), rel):
+                    pass
+            except (ValueError, RuntimeError):
+                continue
+            if not rel.startswith(_SKIP_PREFIXES):
+                out.append(rel)
+    return sorted(out)
+
+
+def changed_files(repo_root: str, old: str, new: str) -> tuple[set[str], set[str]]:
+    """Return (changed, deleted) repo-relative paths between two shas via name-status.
+    `changed` = added/modified/renamed-to; `deleted` = removed/renamed-from. Raises
+    subprocess.CalledProcessError if git can't diff (caller falls back to full)."""
+    out = subprocess.run(  # noqa: S603 - fixed argv
+        ["git", "-C", repo_root, "diff", "--name-status", "-M", f"{old}..{new}"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    changed: set[str] = set()
+    deleted: set[str] = set()
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        status = parts[0]
+        if status.startswith("D"):
+            deleted.add(parts[1])
+        elif status.startswith("R") and len(parts) >= 3:
+            deleted.add(parts[1])   # old name gone
+            changed.add(parts[2])   # new name added
+        else:  # A, M, C, T
+            changed.add(parts[-1])
+    def _filt(s: set[str]) -> set[str]:
+        return {p for p in s if not p.startswith(_SKIP_PREFIXES)}
+    return _filt(changed), _filt(deleted)
+
+
+def _read_path_list(path: str) -> set[str]:
+    """Read a file of repo-relative paths (one per line) into a set; skip blanks + VCS/vendored.
+    Missing file → empty set (caller treats it as 'no changes / no deletions').
+
+    DEFENSE IN DEPTH: these paths are scoped to repo-root and handed to cc (Read/Glob are allowed).
+    Today the list is produced by reindex_local_repo.sh from rsync --itemize-changes, which only
+    ever emits in-tree, relative paths — so nothing escapes. But to keep that true regardless of the
+    caller, fail closed here: normalize and drop any absolute path or one that climbs out via '..'."""
+    if not path or not os.path.isfile(path):
+        return set()
+    out: set[str] = set()
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            rel = line.strip()
+            if not rel or rel.startswith(_SKIP_PREFIXES):
+                continue
+            norm = os.path.normpath(rel)
+            if os.path.isabs(norm) or norm == ".." or norm.startswith(".." + os.sep):
+                logger.warning(json.dumps({"event": "glossary_gen_dropped_unsafe_path", "path": rel}))
+                continue
+            out.add(norm)
+    return out
+
+
+def _write_atomic(path: str, entries: list[glossary.Entry], *, fingerprint: str | None = None,
+                  source_revision: str | None = None, pending_revision: str | None = None,
+                  pending_files: list[str] | None = None) -> None:
+    """Write entries to a temp file then rename — a reader never sees a half-written index
+    (the refresh unit and a live read can race), and the live slice is only swapped by the
+    atomic os.replace (which never runs if the temp write failed, so the OLD slice survives a
+    disk-full/read-only error). On failure, clean up the temp and re-raise OSError so the caller
+    treats it as a build failure (SKIP) rather than a success."""
+    tmp = path + ".new"
+    try:
+        glossary.write_entries(tmp, entries)
+        if fingerprint is not None:
+            # Publish metadata first. Any failure still preserves the old data file.
+            # A crash between the renames leaves a digest mismatch, forcing a retry.
+            glossary_config.stamp(path, fingerprint, content_path=tmp, source_revision=source_revision,
+                                  pending_revision=pending_revision, pending_files=pending_files)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)  # don't leave a stale .new behind (it's never read, but don't litter)
+        except OSError:
+            pass
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description="(re)build a project's glossary")
+    p.add_argument("--project", required=True)
+    p.add_argument("--repo-root", required=True, help="local repo copy to scan (cc cwd)")
+    p.add_argument("--out", required=True, help="entries.jsonl path under /data/glossary/<project>/")
+    p.add_argument("--model", required=True)
+    p.add_argument("--region", required=True)
+    p.add_argument("--sdk", choices=("openai", "claude"), default=os.environ.get("AGENT_SDK", "claude"))
+    p.add_argument("--source", choices=("git", "local"),
+                   help="manifest source; explicit local lists also override .git discovery")
+    p.add_argument("--old", default="", help="git sha BEFORE refresh (omit => full scan)")
+    p.add_argument("--new", default="HEAD", help="git sha AFTER refresh")
+    # LOCAL repos have no git/sha; reindex_local_repo.sh derives the change set from the rsync
+    # report and passes it as files (one repo-relative path per line). Same incremental merge as a
+    # git diff, just a different source. --changed-list wins over --old/--new when given.
+    p.add_argument("--changed-list", default="",
+                   help="file of changed (added/modified) repo-relative paths, one per line "
+                        "(local-repo incremental; alternative to --old/--new)")
+    p.add_argument("--deleted-list", default="",
+                   help="file of deleted repo-relative paths, one per line (pairs with --changed-list)")
+    p.add_argument("--full", action="store_true", help="force a full scan")
+    p.add_argument("--strict", action="store_true", help="treat a cc build failure as fatal")
+    p.add_argument("--timeout", type=int, default=glossary_build.DEFAULT_TIMEOUT_S)
+    p.add_argument("--max-files", type=int, default=None,
+                   help="per-build file cap (wins over GLOSSARY_MAX_FILES env; default 0 = no cap); "
+                        "0 or negative = no cap (scan the whole candidate set)")
+    args = p.parse_args(argv)
+
+    # Deployed workers capture the environment revision and verify it again before
+    # publishing. A worker started before an SDK switch cannot overwrite the new build.
+    config_path = os.environ.get("GLOSSARY_CONFIG_FILE")
+    config_bytes = Path(config_path).read_bytes() if config_path else None
+    cap = args.max_files if args.max_files is not None else MAX_BUILD_FILES
+    if config_bytes:
+        launched_config = os.environ.get("GLOSSARY_WORKER_CONFIG_SHA")
+        if launched_config and launched_config != hashlib.sha256(config_bytes).hexdigest():
+            logger.error(json.dumps({"event": "glossary_gen_stale_launcher", "project": args.project}))
+            return 2
+        values = dict(line.split("=", 1) for line in config_bytes.decode().splitlines() if "=" in line)
+        # Re-read after acquiring the slice lock, so queued workers cannot use stale
+        # arguments captured by a timer before deployment changed the selection.
+        args.sdk = values.get("AGENT_SDK", "claude")
+        args.model = values["MODEL"]
+        args.region = values["REGION"]
+        if values.get("GLOSSARY_ENABLED", "true") == "false" or not args.model:
+            return 0
+        if "GLOSSARY_SUBDIRS" in values and Path(args.out).stem not in values["GLOSSARY_SUBDIRS"].split(","):
+            return 0  # repo removed while this unit was queued; do not recreate its slice
+        if args.max_files is None:
+            cap = int(values.get("GLOSSARY_MAX_FILES", str(cap)) or "0")
+    expected = glossary_config.fingerprint(args.sdk, args.model, args.region, max_files=cap)
+    # Historical CLI callers keep legacy incremental behavior until provenance is
+    # enabled by deployment. OpenAI always requires a matching artifact.
+    track_config = bool(config_path) or args.sdk == "openai" or os.path.exists(args.out + ".meta")
+    config_changed = track_config and not glossary_config.matches(args.out, expected)
+    if config_changed:
+        args.full = True
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    engine = {"sdk": args.sdk, "model": args.model, "region": args.region}
+    if args.sdk == "openai":
+        engine["api"] = "ConverseStream"
+    logger.info(json.dumps({"event": "glossary_gen_start", "project": args.project, **engine}))
+    if not glossary.is_valid_concept_id(args.project) and not args.project.replace("-", "").isalnum():
+        # project id is also a path segment downstream; keep it slug-ish.
+        logger.error(json.dumps({"event": "glossary_gen_bad_project", "project": args.project}))
+        return 2
+    if not os.path.isdir(args.repo_root):
+        logger.error(json.dumps({"event": "glossary_gen_no_repo", "repo_root": args.repo_root}))
+        return 2
+    # A containment check is only as good as the ROOT it is given (AppSec finding 8ea1f697).
+    # glossary_source.source_path() confines every read with
+    # `target.is_relative_to(base) or target == base` — correct as written, and trivially
+    # satisfied for EVERY path on the filesystem when base resolves to "/". `os.path.isdir`
+    # above accepts "/" happily, so the confinement degraded to a no-op without failing.
+    # Reject a root that cannot bound anything. This is hardening, not a privilege boundary:
+    # setting --repo-root already requires command execution on the index host with control
+    # over this argv, and such an attacker reads files with the same uid either way. What it
+    # does remove is the ATTRIBUTION-EVADING path — file contents read through the generator
+    # are laundered into the shared glossary slice and published into chat answers
+    # (glossary_build.py:80-82), which a direct `cat` would not be. The OS-level fix is
+    # InaccessiblePaths=/opt/idx on the build's transient unit (see activate_project.sh);
+    # argv cannot widen a path that is not mounted, so that one bounds this even when the
+    # caller picks the root.
+    _resolved_root = Path(args.repo_root).resolve()
+    if _resolved_root == Path(_resolved_root.anchor) or len(_resolved_root.parts) < 3:
+        logger.error(json.dumps({
+            "event": "glossary_gen_unbounded_repo_root",
+            "repo_root": str(_resolved_root),
+            "detail": "--repo-root must be a project directory (e.g. /data/repo/<subdir>); a "
+                      "filesystem root or top-level directory makes the source-path containment "
+                      "check a no-op",
+        }))
+        return 2
+    # ADOPT THE RESOLVED PATH. Validating `_resolved_root` and then leaving every downstream
+    # operation on the ORIGINAL `args.repo_root` checks one path and uses another: if the
+    # argument is a symlink, re-resolving it later can yield a different target than the one
+    # that passed. Demonstrated with a symlink pointed at a safe directory for the check and
+    # swapped to `/` immediately afterwards — the guard passed and the walk got the root.
+    # Writing the canonical path back closes the window: what was checked is what is used.
+    args.repo_root = str(_resolved_root)
+    # git_fetch may already have advanced HEAD on an earlier failed/locked tick.
+    # Diff from the commit represented by the last successful slice, not that
+    # tick's OLD. Only publication advances the recorded commit.
+    source_revision = None
+    previous_revision = None
+    pending_order: list[str] = []
+    local_lists = bool(args.changed_list or args.deleted_list)
+    local_source = args.source == "local" or local_lists
+    git_source = not local_source and (args.source == "git" or (Path(args.repo_root) / ".git").exists())
+    if track_config and git_source:
+        source_revision = subprocess.run(
+            ["git", "-C", args.repo_root, "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        if args.old and not args.full:
+            progress = glossary_config.metadata(args.out)
+            previous_revision = progress.get("source_revision")
+            if isinstance(previous_revision, str) and previous_revision:
+                # A capped tick may have applied only part of this commit. Diff
+                # newer commits from its pending cursor, then retry its tail.
+                pending_order = progress.get("pending_files", [])
+                if not isinstance(pending_order, list) or any(not isinstance(p, str) for p in pending_order):
+                    pending_order = []
+                    args.full = True
+                args.old = progress.get("pending_revision") or previous_revision
+                args.new = source_revision
+            else:
+                args.full = True
+
+    # Resolve the per-build file cap: --max-files flag wins, else the module default
+    # (GLOSSARY_MAX_FILES env; default 0 = no cap). <=0 means "no cap" (whole candidate set).
+    uncapped = cap <= 0
+
+    # Local pushes have no commit cursor. Keep their unacknowledged changes under
+    # the same slice lock until data publication succeeds, so a failed push build
+    # is retried even if the next rsync reports no new changes.
+    pending_path = Path(args.out + ".pending")
+    local_changed, local_deleted = set(), set()
+    track_local = track_config and source_revision is None and (local_source or pending_path.exists())
+    if track_local:
+        try:
+            pending = json.loads(pending_path.read_text()) if pending_path.exists() else {}
+            for key in ("changed", "deleted"):
+                if not isinstance(pending.get(key, []), list) or any(
+                    not isinstance(path, str) for path in pending.get(key, [])
+                ):
+                    raise ValueError("invalid pending paths")
+            local_changed = set(pending.get("changed", []))
+            local_deleted = set(pending.get("deleted", []))
+            pending_order = pending.get("changed", [])
+            args.full = args.full or pending.get("full", False)
+        except (OSError, ValueError, TypeError, AttributeError):
+            args.full = True  # damaged progress record: rebuild from the authoritative tree
+        changed_now = _read_path_list(args.changed_list)
+        deleted_now = _read_path_list(args.deleted_list)
+        local_changed = (local_changed - deleted_now) | changed_now
+        local_deleted = (local_deleted - changed_now) | deleted_now
+        try:
+            pending_path.parent.mkdir(parents=True, exist_ok=True)
+            stage = Path(str(pending_path) + ".new")
+            ordered_changed = [path for path in dict.fromkeys(pending_order + sorted(local_changed))
+                               if path in local_changed]
+            stage.write_text(json.dumps({"changed": ordered_changed, "deleted": sorted(local_deleted),
+                                         "full": bool(args.full)}) + "\n")
+            stage.replace(pending_path)
+        except OSError:
+            logger.error(json.dumps({"event": "glossary_gen_progress_write_failed", "project": args.project}))
+            return 2
+
+    # Incremental source: an explicit change LIST (local repos, no git) wins over git --old/--new.
+    use_list = (local_lists or track_local) and not args.full
+    incremental = (use_list or bool(args.old)) and not args.full
+    files: list[str] | None = None
+    deleted: set[str] = set()
+    existing: list[glossary.Entry] = []
+
+    if incremental:
+        diff_ok = True
+        if use_list:
+            chg = local_changed if track_local else _read_path_list(args.changed_list)
+            deleted = local_deleted if track_local else _read_path_list(args.deleted_list)
+            if track_local:
+                # Detached pushes can acquire the lock out of launch order.
+                # Reconcile deletions against the current tree (delete then re-add).
+                for path in list(deleted):
+                    try:
+                        if source_path(Path(args.repo_root), path).is_file():
+                            chg.add(path)
+                            deleted.discard(path)
+                    except (OSError, ValueError, RuntimeError):
+                        pass
+        else:
+            try:
+                chg, deleted = changed_files(args.repo_root, args.old, args.new)
+                chg = (chg | set(pending_order)) - deleted
+            except subprocess.CalledProcessError as exc:
+                logger.warning(json.dumps({"event": "glossary_gen_diff_failed_fallback_full",
+                                           "detail": str(exc)[:200]}))
+                incremental = False
+                diff_ok = False
+        if diff_ok:
+            if not chg and not deleted:
+                if track_local:
+                    pending_path.unlink(missing_ok=True)
+                logger.info(json.dumps({"event": "glossary_gen_noop_empty_diff",
+                                        "project": args.project, "old": args.old, "new": args.new}))
+                return 0  # HEAD unchanged → no cc call, keep the index as-is
+            # Drop docs/asset/CI-only changes: a commit that touched no term-bearing file
+            # shouldn't spend a cc call. Deletions still apply to ALL changed paths (a deleted
+            # term file's entries must go regardless of the term filter on the build set).
+            files = []
+            # Retry older unprocessed paths before new changes, avoiding starvation
+            # when an alphabetically earlier file changes on every timer tick.
+            for path in dict.fromkeys(pending_order + sorted(chg)):
+                if path not in chg:
+                    continue
+                if not _is_term_file(path):
+                    continue
+                try:
+                    target = source_path(Path(args.repo_root), path)
+                    if track_local and not target.is_file():
+                        deleted.add(path)
+                        continue
+                    with open_source(Path(args.repo_root), path):
+                        pass
+                except OSError as exc:
+                    logger.error(json.dumps({"event": "glossary_source_read_failed",
+                                             "project": args.project, "error": type(exc).__name__}))
+                    return 2  # keep the artifact and its unacknowledged source changes
+                except (ValueError, RuntimeError):
+                    deleted.add(path)  # an eligible file replaced by a withheld symlink
+                    continue
+                files.append(path)
+            if not files and not deleted:
+                logger.info(json.dumps({"event": "glossary_gen_noop_no_term_files",
+                                        "project": args.project, "changed": len(chg)}))
+                return 0  # only docs/assets changed → nothing to (re)build, index unchanged
+            if os.path.isfile(args.out):
+                existing = glossary.read_entries(args.out)
+    if not incremental:
+        # FULL scan: bound it to candidate term-bearing files instead of letting cc roam the
+        # whole repo (the previously-uncapped cost). Cap at MAX_BUILD_FILES; log any drop.
+        try:
+            cands = candidate_files(args.repo_root)
+        except OSError as exc:
+            logger.error(json.dumps({"event": "glossary_source_read_failed",
+                                     "project": args.project, "error": type(exc).__name__}))
+            return 2  # a partial scan must never replace a previously complete slice
+        if not uncapped and len(cands) > cap:
+            logger.warning(json.dumps({"event": "glossary_gen_full_capped",
+                                       "project": args.project, "candidates": len(cands),
+                                       "cap": cap, "dropped": len(cands) - cap}))
+            cands = cands[:cap]
+        files = cands
+
+    # Cap the incremental build set too (a giant single commit shouldn't launch an unbounded scan).
+    remaining_files: list[str] = []
+    if incremental and files and not uncapped and len(files) > cap:
+        logger.warning(json.dumps({"event": "glossary_gen_incremental_capped",
+                                   "project": args.project, "changed_term_files": len(files),
+                                   "cap": cap, "deferred": len(files) - cap}))
+        remaining_files = files[cap:]
+        files = files[:cap]
+
+    # Build the slice with cc. `files` is now ALWAYS a concrete list (full=candidates,
+    # incremental=changed term files) — never None — so cc always gets a bounded file scope.
+    rebuilt: list[glossary.Entry] = []
+    if files:
+        try:
+            sdk_options = {"sdk": args.sdk} if args.sdk != "claude" else {}
+            rebuilt = glossary_build.build(
+                files, project=args.project, cwd=args.repo_root,
+                model=args.model, region=args.region, timeout=args.timeout, **sdk_options)
+        except (subprocess.SubprocessError, OSError) as exc:
+            logger.error(json.dumps({"event": "glossary_gen_cc_failed",
+                                     "project": args.project, "detail": str(exc)[:200]}))
+            if args.strict or config_changed:
+                return 2
+            return 0  # SKIP: keep the existing glossary rather than blank it on a transient error
+
+    explicit_empty = isinstance(rebuilt, glossary_build.BuildEntries) and rebuilt.explicit_empty
+    if incremental:
+        # Conservative guard: cc exited 0 but produced NOTHING for changed (non-deleted) files.
+        # That's far more likely a silent cc failure (throttle/garbage) than every changed file
+        # genuinely losing all its terms. Rather than drop those files' existing entries (shrinking
+        # the slice), SKIP and keep the slice as-is — UNLESS this diff is purely deletions (then an
+        # empty rebuilt is correct and we must apply the deletions), or every batch
+        # explicitly returned [] to confirm that the files no longer contain terms.
+        if files and not rebuilt and not explicit_empty:
+            logger.warning(json.dumps({"event": "glossary_gen_empty_rebuild_skip",
+                                       "project": args.project, "changed_files": len(files)}))
+            return 2 if args.strict else 0
+        merged = glossary_build.merge_incremental(
+            existing, changed=set(files or []), deleted=deleted, rebuilt=rebuilt)
+    else:
+        merged = rebuilt
+
+    if config_changed and files and not merged and not explicit_empty:
+        logger.error(json.dumps({"event": "glossary_config_rebuild_empty", "sdk": args.sdk}))
+        return 2
+    try:
+        with glossary_config.publish_guard(config_path, config_bytes):
+            if source_revision is not None:
+                current_revision = subprocess.run(
+                    ["git", "-C", args.repo_root, "rev-parse", "HEAD"],
+                    capture_output=True, text=True, check=True,
+                ).stdout.strip()
+                if current_revision != source_revision:
+                    raise RuntimeError("repository changed during glossary build")
+            os.makedirs(os.path.dirname(args.out), exist_ok=True)
+            if track_config:
+                # Data and its Git tail are stamped together. Do not advance the
+                # completed revision until every eligible change was processed.
+                _write_atomic(
+                    args.out, merged, fingerprint=expected,
+                    source_revision=previous_revision if remaining_files and source_revision else source_revision,
+                    pending_revision=source_revision if remaining_files else None,
+                    pending_files=remaining_files if source_revision else None,
+                )
+            else:
+                _write_atomic(args.out, merged)
+            if track_local:
+                if remaining_files:
+                    # Only acknowledge this batch AFTER its data was published.
+                    # If this update fails, the older, larger pending list survives.
+                    stage = Path(str(pending_path) + ".new")
+                    stage.write_text(json.dumps({"changed": remaining_files, "deleted": [], "full": False}) + "\n")
+                    stage.replace(pending_path)
+                else:
+                    pending_path.unlink(missing_ok=True)
+    except (OSError, RuntimeError) as exc:
+        # disk full / read-only / temp unwritable — the live slice was NOT swapped (os.replace
+        # never ran), so old data is intact. Log + SKIP cleanly instead of a raw traceback.
+        logger.error(json.dumps({"event": "glossary_gen_write_failed",
+                                 "project": args.project, "detail": str(exc)[:200]}))
+        return 2 if args.strict or config_changed else 0
+    concepts = glossary.aggregate(merged)
+    logger.info(json.dumps({"event": "glossary_gen_done", "project": args.project,
+                            **engine,
+                            "mode": "incremental" if incremental else "full",
+                            "entries": len(merged), "concepts": len(concepts),
+                            "changed_files": len(files) if files else None}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

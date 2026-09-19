@@ -1,0 +1,72 @@
+# AI dev tools
+.claude/
+.cursor/
+.windsurf/
+.aider/
+.copilot/
+
+# Node
+node_modules/
+dist/
+cdk.out/
+coverage/
+.stryker-tmp/
+reports/
+*.tsbuildinfo
+
+# Python
+.venv/
+.hatch_venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Secrets & credentials
+.env
+.env.*
+*.pem
+*.key
+cdk.context.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local deploy state (account-specific, not committed)
+.local/
+
+# codegraph local graph/home artifacts (RocksDB graph.db + per-repo HOME); never commit.
+# Created by a local codegraph-server run and by the index host's per-repo build
+# (HOME=<repo>/.home). Pure generated data.
+.home/
+.codegraph/
+.artifact_sig
+
+# Agent scratch space (drafts, scratch files) — not part of the repo
+.agent/
+
+# Internal / dev-only
+.superpowers/
+/build/
+
+# The CodeGraph engine binary. This sample does NOT redistribute it (Apache-2.0, carries a NOTICE
+# obligation), and deploy-all.sh's own failure message tells the operator to drop it in the repo
+# root and point CODEGRAPH_SERVER_BIN at $PWD — so the likeliest way it ever gets committed is by
+# following our own instructions. check-invariants 8b fails on a TRACKED match; this keeps it from
+# showing up as untracked noise in the first place.
+codegraph-server
+codegraph-server-*
+!codegraph-server-*.md
+# `cargo build --release -p codegraph-server` runs inside a separately cloned CodeGraph tree, so
+# this is belt-and-braces for anyone who builds it in place.
+/target/

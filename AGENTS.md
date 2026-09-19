@@ -1,0 +1,142 @@
+# AGENTS.md
+
+Guidance for AI coding agents working in this repo. This file is the single source
+of truth for agent conventions; it links out rather than duplicating. Human onboarding
+docs live in `docs/` (中文为主，结构文档双语 `_en`/`_zh`)。
+
+根 `README.md` 合并中文与英文（中文在前、英文在后），修改时同步两部分，不另建中文 README。
+正式发布仓库名称为 sample-code-qa-on-agentcore，公开仓库为 `aws-samples/sample-code-qa-on-agentcore`；部署资源与产品内部标识继续使用 `source-truth`。
+
+## Project overview
+
+source-truth 是「代码为唯一依据」的飞书游戏研发代码问答助手。完整链路：策划在飞书 @机器人 →
+**bot-gateway**（TypeScript 长驻网关，长连接事件订阅，按会话路由）→ **AgentCore Runtime**
+（Firecracker microVM，会话隔离）→ microVM 内的 **agent-container**（Python，部署时选择 OpenAI Agents SDK
+或 Claude Agent SDK，新项目默认 OpenAI，均走 Bedrock）→ 通过 **index-service**（常驻 CodeGraph，MCP-over-HTTP）定位代码、用只读
+文件工具读取最新主分支源码与配置表（工具清单见 `docs/agent/architecture.md`；仓库副本只在 index-service
+本地磁盘，会话 microVM 不挂仓库文件系统）→ **CardKit 流式卡片**回传。
+
+核心架构特征：AI 引擎在 microVM **内**自主运行（不是容器外的远程 MCP 客户端），并新增飞书 Bot 网关与
+独立 CodeGraph 索引服务两个有状态组件——后者持有唯一一份代码仓本地副本，定位代码和读文件也全部走
+HTTP 接口（不挂任何共享文件系统）。架构工作原理见 `docs/agent/architecture.md`。
+
+SDK 选择统一控制问答和离线术语表；配置、旧项目兼容与切换验证见 `docs/dual-sdk_zh.md`。
+OpenAI Agents SDK 不等于 Codex SDK，后者仍在 post-MVP 边界外。
+
+语言：Python（`agent-container/`）、TypeScript / Node 24（`bot-gateway/`、未来 `infra/` CDK）、
+Bash（`scripts/`）。会话容器 ARM64-only。
+
+## Setup & commands
+
+各组件自带锁文件，构建与测试一律以它们为准：`agent-container/requirements.lock`、
+`index-service/requirements.lock`、`bot-gateway/package-lock.json`。网关构建为
+`npm ci && npm run build`，部署时再 `npm prune --omit=dev`；不能依赖个人手建 venv
+或临时改用其他包源。运行结果必须注明本地解析版本与锁文件的差异，以及未执行的
+CodeGraph 集成测试。
+本地检查如使用与锁文件不同的 OpenAI / Agents SDK 版本，必须保留版本差异报告，
+不能把该测试环境说成部署锁文件的逐项复现。
+部署镜像使用 Python 3.11；本地检查如使用更高版本，报告必须说明这一解释器差异，
+不能将高版本的测试结果当作该部署镜像上的执行结果。
+结构检查在没有 `.git` 的源码包上使用全量文件枚举，不跳过清单相关守卫。
+
+当前已实现：
+
+```bash
+./scripts/check-invariants.sh   # 结构自检：AGENTS / structure / 双语配对 / 顶层目录
+
+# 各组件依赖见其 README（agent-container: uv；bot-gateway: npm）。
+./scripts/test.sh           # 已实现。离线默认：lint + unit + typecheck（CI 跑这个）
+./scripts/test.sh --full    # 已实现。加 e2e（对已部署 Runtime 跑真实问答，缺部署自动 skip）+ smoke（仍占位）
+# 一键部署（已实现、全新账号/区域可跑、幂等）：artifacts→IAM→network→index-service→镜像→Runtime→gateway
+# 仓库不再走命令行，改由 .local/projects.json 配置（推荐 install.sh 交互式添加项目）
+./scripts/deploy-all.sh --region <r>   # 加 --dry-run 仅打印计划
+./scripts/apply-monitoring.sh --region <r>   # 单独刷新监控（看板/指标/告警/DAU；--only 选单阶段）
+```
+
+规划中的命令（**尚未实现**，阶段标注见 `scripts/README.md`；不要当作已存在去调用）：
+
+```bash
+./scripts/ops.sh status     # (p2) 运维：三组件健康 + 索引时效
+```
+
+MVP 阶段 Runtime 用 `agentcore` starter toolkit / boto3 配，不强求 CDK——见
+`docs/agent/architecture.md` 的 provisioning 分工。
+
+## Project structure
+
+完整目录树见 `docs/structure_zh.md`（权威，改顶层目录必须同步）。顶层：`agent-container/`（Python
+Agent）、`bot-gateway/`（TS 网关 + CardKit）、`index-service/`（CodeGraph 索引 + MCP 接口）、
+`infra/`（IaC）、`config/`（i18n / 阈值）、`scripts/`（运维）、
+`docs/`（面向人）+ `docs/agent/`（面向 AI）+ `docs/design/`（导入的设计权威依据）。
+
+**生成物 / 不可手改：** `infra/cdk.out/`、`node_modules/`、`.venv/`、构建产物。源 → 生成物映射表见
+`docs/agent/invariants.md`。
+
+## Code style
+
+- TypeScript（`bot-gateway/`、`infra/`）：ESLint 即格式化器，不另配 Prettier；strict 模式；未用参数前缀 `_`。
+- Python（`agent-container/`、可能的 `index-service/`）：遵循 `ruff` / `black` 默认；类型标注。
+- 结构化 JSON 日志（`console.log(JSON.stringify({...}))` / 等价），用户标识用 `hashUserId` 脱敏，
+  实现见 `bot-gateway/src/log.ts`。
+- 工具 / MCP 命名清晰、动宾式。
+
+## Testing
+
+`./scripts/test.sh`（**已实现**）是单一入口。离线默认安全（lint + unit + typecheck）；`--full` 才跑
+需要 AWS 的 e2e（`scripts/e2e-probe.py`：对已部署 Runtime 跑真实问答，缺部署自动 skip）与 smoke（仍占位）。
+CI（`.github/workflows/ci.yml`）跑离线套件；本仓库不带 git hook，本地请自行在推前运行。
+结构自检 `./scripts/check-invariants.sh` 由 lint 层调用。
+
+## Critical constraints（详见 docs/agent/invariants.md）
+
+- **代码为唯一依据**：答案必须基于 index-service 服务的最新主分支真实代码 + CodeGraph 取证；代码与文档 / 记忆
+  冲突时以代码为准，并标注差异与文档时间；低置信度转研发。
+- **会话容器 ARM64-only**；基础镜像、Claude Agent SDK 版本固定（pin），漂移由
+  `scripts/check-versions.sh`（已实现，`test.sh --lint` 调用）守卫。`@anthropic-ai/claude-code`
+  CLI 在 agent 镜像与 index 主机安装路径中使用同一 exact semver；修改版本须同步两处，并重新执行 ARM64
+  runtime 与术语表验证。（注：lark-cli 仅是
+  开发期手测工具，不装进任何运行镜像，也不在该守卫范围内。）
+- **生成物绝不手改**——改源再重生成。
+- **改顶层目录 ⇒ 同步 `docs/structure_zh.md`（及 `_en.md`）**；**新增 `docs/*_en.md` ⇒ 补 `_zh.md`**（反之亦然）。
+- **MVP 边界**：仅主分支、仅只读问答、不跑引擎、不写回 / 提交。越界能力（设计文档读取、多分支、
+  共享记忆、审计护栏、Codex、数值模拟）一律后置。
+- **「不跑引擎」的一处明确例外——构建期引擎（术语表生成，2026-06-22）**：「不跑引擎」约束的是按用户提问
+  实时回答的引擎（必须在 microVM 内）。术语表生成是**离线构建期引擎**：在 index 主机用所选 OpenAI Agents SDK 或本地 `claude` CLI
+  扫自有代码副本产出「中文词→英文符号」对照表——无用户输入、无会话、不在请求路径上，受只读工具限制 +
+  产物只读服务 + grounding 校验三重约束。完整边界与机制见 `docs/agent/invariants.md` §6 与
+  `docs/agent/glossary.md`。
+
+`scripts/check-invariants.sh`（已实现；由 `test.sh --lint` 与 CI 调用）强制其中可自动检查的子集。
+
+## Boundaries
+
+**Never:**
+- 提交密钥 / token（飞书凭证走 Secrets Manager——`install.sh` 交互式创建
+  `source-truth/feishu-<projectId>` 密钥，bot-gateway 的 `run.sh` 启动时取出注入进程环境，不落盘、不入仓库）。
+- 手改生成物。
+- 让 MVP 越过只读边界（写回代码、跑引擎、提交）。
+
+**Ask first:**
+- 增删 OAuth scope 或改机器人身份行为。
+- 破坏性基础设施变更（删资源、`teardown.sh`）。
+- bump Claude Agent SDK / lark-cli / 基础镜像版本。
+- 把任何 post-MVP 能力提前纳入。
+
+## Commit / PR
+
+- Conventional Commits 前缀（`feat:`、`fix:`、`docs:`、`chore(deps):`）。
+- 分支命名 `<type>/<short-kebab-summary>`，与 commit 前缀一致。
+- **不要**加 `Co-Authored-By` 或任何 AI 署名 trailer。
+- 推之前跑 `./scripts/test.sh`，通过再推（没有 git hook 替你做这件事；CI 会复核）。
+- 注意 `test.sh` 结尾的 `SKIPPED:` 行：依赖缺失的套件会被跳过，此时的"全绿"并不代表跑过。
+
+## Key resources
+
+- 架构工作原理：`docs/agent/architecture.md`
+- 术语表（把中文提问映射到英文代码符号）：`docs/agent/glossary.md`
+- CardKit 流式答案卡调研（`bot-gateway` 核心能力）：`docs/agent/cardkit-streaming-spike.md`
+- 不变量与权威依据映射：`docs/agent/invariants.md`
+- 变更手册：`docs/agent/playbooks.md`
+- 部署 / 连飞书 / 运维 / 排错：`docs/runbook_zh.md`（英文：`docs/runbook_en.md`）
+- 目录结构：`docs/structure_zh.md` · `docs/structure_en.md`
+- 需求 / 架构设计权威依据：`docs/design/requirements_zh.md` · `docs/design/architecture-overview_zh.md`

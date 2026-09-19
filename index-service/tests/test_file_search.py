@@ -1,0 +1,295 @@
+"""Unit tests for file_search — the fast local-disk content search that replaces
+the agent's slow EFS Grep. Uses a tiny temp repo (real ripgrep/grep on local
+disk, no EFS, no network). Asserts: matches found, paths returned repo-relative,
+no-match returns empty (not an error), glob filtering, and the command builder
+shape.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+SVC_DIR = Path(__file__).resolve().parent.parent
+if str(SVC_DIR) not in sys.path:
+    sys.path.insert(0, str(SVC_DIR))
+
+import file_search  # noqa: E402
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "hero.cs").write_text(
+        "public int MaxEncumbrance() { return Strength * 1.5; }\n", encoding="utf-8"
+    )
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "items.json").write_text('{"MaxEncumbrance": 150}\n', encoding="utf-8")
+    (tmp_path / "readme.md").write_text("no relevant token here\n", encoding="utf-8")
+    return tmp_path
+
+
+def test_finds_matches_and_returns_relative_paths(repo: Path):
+    out = file_search.run_search("MaxEncumbrance", local_root=str(repo))
+    assert out["count"] >= 2, out
+    # Every returned path is repo-relative (never the local root, never absolute).
+    for m in out["matches"]:
+        assert not m["path"].startswith("/"), m   # repo-relative, no leading slash
+        assert str(repo) not in m["path"]
+        assert isinstance(m["line"], int) and m["line"] >= 1
+    # The .cs and .json files both matched.
+    paths = " ".join(m["path"] for m in out["matches"])
+    assert "src/hero.cs" in paths and "config/items.json" in paths
+
+
+def test_glob_narrows_by_filetype(repo: Path):
+    out = file_search.run_search("MaxEncumbrance", local_root=str(repo), glob="*.json")
+    assert out["count"] >= 1
+    assert all(m["path"].endswith(".json") for m in out["matches"]), out
+
+
+def test_no_match_returns_empty_not_error(repo: Path):
+    out = file_search.run_search("zzz_no_such_token_zzz", local_root=str(repo))
+    assert out["count"] == 0
+    assert out["matches"] == []
+    assert out["truncated"] is False
+
+
+def test_empty_pattern_raises(repo: Path):
+    with pytest.raises(ValueError):
+        file_search.run_search("   ", local_root=str(repo))
+
+
+@pytest.mark.parametrize("force_grep", [False, True])
+def test_gbk_encoded_file_in_results_does_not_crash(tmp_path: Path, monkeypatch, force_grep):
+    # REGRESSION: a GBK/GB2312 source file (common in Chinese game repos) in the search
+    # results made the strict-UTF-8 decode of rg/grep stdout raise UnicodeDecodeError,
+    # crashing the WHOLE search (even an ASCII query) into a generic internal error.
+    # errors="replace" must let the search still return its matches.
+    if force_grep:
+        monkeypatch.setattr(file_search, "_rg_available", lambda: False)
+    (tmp_path / "skill.cs").write_bytes("// 火球术 id=5 伤害500".encode("gbk"))
+    out = file_search.run_search("id=5", local_root=str(tmp_path))
+    assert out["count"] >= 1  # found the ASCII token despite the GBK bytes
+
+
+@pytest.mark.parametrize("force_grep", [False, True])
+def test_bad_regex_raises_value_error_not_runtime(repo: Path, monkeypatch, force_grep):
+    # An unbalanced regex group is a recoverable USER-input error → ValueError (the
+    # bridge forwards its detail as "bad search pattern"), not a generic RuntimeError.
+    if force_grep:
+        monkeypatch.setattr(file_search, "_rg_available", lambda: False)
+    with pytest.raises(ValueError, match="bad search pattern"):
+        file_search.run_search("foo(", local_root=str(repo))
+
+
+def test_search_to_json_is_valid_json(repo: Path):
+    import json
+    s = file_search.search_to_json("MaxEncumbrance", local_root=str(repo))
+    d = json.loads(s)
+    assert "matches" in d and "count" in d and "deduped" in d
+
+
+def test_finds_gitignored_and_hidden_files(tmp_path: Path):
+    # "代码为唯一依据": a file physically on disk must be searchable even if it is
+    # .gitignore'd or a dotfile — rg defaults would silently hide both. Build a
+    # real git tree so rg's .gitignore logic activates, then assert we still find
+    # the gitignored file and the dotfile.
+    import subprocess
+    (tmp_path / ".gitignore").write_text("generated.cs\n", encoding="utf-8")
+    (tmp_path / "generated.cs").write_text("int SECRETTOKENVALUE = 1;\n", encoding="utf-8")
+    (tmp_path / ".hidden.json").write_text('{"SECRETTOKENVALUE": 2}\n', encoding="utf-8")
+    (tmp_path / "normal.cs").write_text("int SECRETTOKENVALUE = 3;\n", encoding="utf-8")
+    # make it a git work-tree so rg would (wrongly) honor .gitignore without --no-ignore
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=False)
+    out = file_search.run_search("SECRETTOKENVALUE", local_root=str(tmp_path))
+    paths = " ".join(m["path"] for m in out["matches"])
+    assert "generated.cs" in paths, f"gitignored file must be found: {paths}"
+    assert ".hidden.json" in paths, f"dotfile must be found: {paths}"
+    assert "normal.cs" in paths
+
+
+def test_dedups_duplicated_copies(tmp_path: Path):
+    # A repo with N identical copies of a tree (vendored/duplicated code, like the
+    # test repo's 10x dfu_scripts_N) must NOT return the same hit N times — that
+    # 10x'd the agent's context and made answers minutes-slow. The copies differ
+    # ONLY in their top-level dir (copy_a/Game/Enemy.cs vs copy_b/Game/Enemy.cs),
+    # so the (path-without-top-dir, line, text) key folds them to one match.
+    for copy in ("copy_a", "copy_b", "copy_c"):
+        d = tmp_path / copy / "Game"
+        d.mkdir(parents=True)
+        (d / "Enemy.cs").write_text("int Damage = UNIQUE_MARKER_X;\n", encoding="utf-8")
+    out = file_search.run_search("UNIQUE_MARKER_X", local_root=str(tmp_path))
+    # 3 identical copies → exactly ONE match, not three…
+    assert out["count"] == 1, out
+    assert "Enemy.cs" in out["matches"][0]["path"]
+    # …and the fold is REPORTED (not silent): the agent sees 2 hits were collapsed
+    # and can re-search a specific copy dir if it actually needs the duplicates.
+    assert out["deduped"] == 2, out
+
+
+def test_does_not_over_dedup_distinct_subpaths(tmp_path: Path):
+    # The key keeps the path BELOW the top-level dir as a discriminator, so two
+    # genuinely-different files at different sub-paths are NOT collapsed even with
+    # identical line text — only whole-tree copies (same sub-path) fold. This is
+    # strictly less aggressive than a bare-basename key.
+    (tmp_path / "pkg" / "combat").mkdir(parents=True)
+    (tmp_path / "pkg" / "ui").mkdir(parents=True)
+    (tmp_path / "pkg" / "combat" / "Util.cs").write_text("int v = SHARED_TOKEN;\n", encoding="utf-8")
+    (tmp_path / "pkg" / "ui" / "Util.cs").write_text("int v = SHARED_TOKEN;\n", encoding="utf-8")
+    out = file_search.run_search("SHARED_TOKEN", local_root=str(tmp_path))
+    assert out["count"] == 2, out  # combat/Util.cs ≠ ui/Util.cs → both kept
+    assert out["deduped"] == 0, out
+
+
+def test_does_not_over_dedup_distinct_files(tmp_path: Path):
+    # Different files (different basenames) with the same line content are kept.
+    (tmp_path / "A.cs").write_text("int v = SHARED_TOKEN;\n", encoding="utf-8")
+    (tmp_path / "B.cs").write_text("int v = SHARED_TOKEN;\n", encoding="utf-8")
+    out = file_search.run_search("SHARED_TOKEN", local_root=str(tmp_path))
+    assert out["count"] == 2, out  # distinct basenames → both kept
+
+
+def test_root_file_not_folded_with_nested_same_name(tmp_path: Path):
+    # A repo-ROOT file and a nested file sharing a basename + line + text must NOT
+    # fold: the root file has no top-level dir to drop, so it must stay distinct
+    # from a nested file whose suffix degenerates to the same basename. (Regression
+    # for the bare-basename degeneration the docstring promises it avoids.)
+    (tmp_path / "Config.cs").write_text("int v = ROOT_TOKEN;\n", encoding="utf-8")
+    (tmp_path / "legacy").mkdir()
+    (tmp_path / "legacy" / "Config.cs").write_text("int v = ROOT_TOKEN;\n", encoding="utf-8")
+    out = file_search.run_search("ROOT_TOKEN", local_root=str(tmp_path))
+    assert out["count"] == 2, out  # /Config.cs ≠ /legacy/Config.cs → both kept
+    assert out["deduped"] == 0, out
+
+
+def test_dup_cap_bounds_heavy_duplication(tmp_path: Path):
+    # Under pathological duplication almost every hit is a fold (never appends), so
+    # the max_matches break can't fire — the scan must still be bounded by
+    # SCAN_DUP_CAP so the loop can't iterate unbounded output. Force a tiny cap and
+    # assert truncation kicks in well before processing everything.
+    import file_search as fs
+    orig = fs.SCAN_DUP_CAP
+    fs.SCAN_DUP_CAP = 5
+    try:
+        # Many identical copies (all fold to one match) — dup rows >> 5.
+        for i in range(20):
+            d = tmp_path / f"copy_{i}" / "Game"
+            d.mkdir(parents=True)
+            (d / "Enemy.cs").write_text("int Damage = CAP_TOKEN;\n", encoding="utf-8")
+        out = fs.run_search("CAP_TOKEN", local_root=str(tmp_path))
+        # Folds to 1 kept match, but the scan stopped at the dup cap.
+        assert out["count"] == 1, out
+        assert out["truncated"] is True, out
+        assert out["deduped"] <= fs.SCAN_DUP_CAP, out
+    finally:
+        fs.SCAN_DUP_CAP = orig
+
+
+def test_dup_flood_does_not_starve_distinct_matches(tmp_path: Path):
+    # Regression for the round-3 finding: a flood of folded duplicates emitted
+    # BEFORE distinct files must NOT consume the distinct-match budget. With the
+    # cap gating on duplicates alone, distinct hits keep being appended even after
+    # a large dup flood. Force a small dup cap; ensure a distinct file that sorts
+    # AFTER the dup flood is still surfaced.
+    import file_search as fs
+    orig = fs.SCAN_DUP_CAP
+    fs.SCAN_DUP_CAP = 100  # generous enough to pass the flood, small enough to bound
+    try:
+        # "0_dups": many identical copies of one file → fold to 1 match, many dups.
+        for i in range(8):
+            d = tmp_path / "0_dups" / f"copy_{i}"
+            d.mkdir(parents=True)
+            (d / "Same.cs").write_text("int x = FLOOD_TOKEN;\n", encoding="utf-8")
+        # "9_distinct": a genuinely distinct file that sorts AFTER the dup flood.
+        d2 = tmp_path / "9_distinct"
+        d2.mkdir()
+        (d2 / "Unique.cs").write_text("int y = FLOOD_TOKEN;\n", encoding="utf-8")
+        out = fs.run_search("FLOOD_TOKEN", local_root=str(tmp_path))
+        paths = " ".join(m["path"] for m in out["matches"])
+        # The distinct file after the flood is NOT starved out.
+        assert "9_distinct/Unique.cs" in paths, out
+    finally:
+        fs.SCAN_DUP_CAP = orig
+
+
+def test_same_basename_collapse_is_never_silent(tmp_path: Path):
+    # Worst case for any content-fold: two genuinely-distinct files that DO share
+    # the same sub-path tail + line + text (moduleA/Utils.cs vs moduleB/Utils.cs,
+    # differing only in top-level dir). The reviewer flagged that folding these is
+    # ambiguous (could be vendored copies, could be two real modules). We accept the
+    # fold for speed BUT it must be VISIBLE: deduped>0 tells the agent a hit was
+    # collapsed so it can recover by re-searching a subdir — no invisible recall loss.
+    (tmp_path / "moduleA").mkdir()
+    (tmp_path / "moduleB").mkdir()
+    (tmp_path / "moduleA" / "Utils.cs").write_text("int Clamp = AMBIG_TOKEN;\n", encoding="utf-8")
+    (tmp_path / "moduleB" / "Utils.cs").write_text("int Clamp = AMBIG_TOKEN;\n", encoding="utf-8")
+    out = file_search.run_search("AMBIG_TOKEN", local_root=str(tmp_path))
+    assert out["deduped"] > 0, f"a same-tail collapse must be reported, not silent: {out}"
+
+
+def test_build_command_does_not_skip_gitignored_or_hidden():
+    cmd = file_search.build_command("foo", "/data/repo/x", glob=None, max_matches=50)
+    if cmd[0] == "rg":
+        assert "--no-ignore" in cmd, "rg must not skip .gitignore'd files (they exist on disk)"
+        assert "--hidden" in cmd, "rg must include dotfiles"
+
+
+def test_build_command_per_file_cap_allows_dense_tables():
+    # REGRESSION: --max-count was 5, which silently dropped the 6th+ hit in ONE file
+    # (e.g. a config/data table holding many relevant rows). It must now be >5 so a
+    # dense single-file table isn't truncated mid-data.
+    cmd = file_search.build_command("foo", "/data/repo/x", glob=None, max_matches=200)
+    if cmd[0] == "rg":
+        i = cmd.index("--max-count")
+        assert int(cmd[i + 1]) == file_search.MAX_PER_FILE
+        assert file_search.MAX_PER_FILE >= 50
+
+
+@pytest.mark.parametrize("force_grep", [False, True])
+def test_search_returns_many_hits_in_one_file(tmp_path, monkeypatch, force_grep):
+    # A single file with 30 matching rows (like a race-class table) must return all of
+    # them (capped only by MAX_PER_FILE=50), not the old 5.
+    if force_grep:
+        monkeypatch.setattr(file_search, "_rg_available", lambda: False)
+    rows = "\n".join(f"(1,{c},0,12,-8949,-132,84)," for c in range(30))
+    (tmp_path / "data.sql").write_text("INSERT INTO playercreateinfo VALUES\n" + rows + "\n")
+    out = file_search.run_search(r"^\(1,", local_root=str(tmp_path))
+    assert out["count"] == 30, out["count"]  # all rows, not truncated to 5
+
+
+def test_grep_fallback_keeps_utf8_text_and_skips_nul_binary(tmp_path, monkeypatch):
+    monkeypatch.setattr(file_search, "_rg_available", lambda: False)
+    (tmp_path / "text.cs").write_text("// 技能 NEEDLE\n", encoding="utf-8")
+    (tmp_path / "binary.dat").write_bytes(b"\0NEEDLE\n")
+    result = file_search.run_search("NEEDLE", local_root=str(tmp_path))
+    assert [match["path"] for match in result["matches"]] == ["text.cs"]
+    assert "技能" in result["matches"][0]["text"]
+
+
+def test_build_command_scopes_to_root_and_glob():
+    cmd = file_search.build_command("foo", "/data/repo/x", glob="*.cs", max_matches=50)
+    assert cmd[0] in ("rg", "grep")
+    # the search root is always the LAST positional (local copy, never EFS)
+    assert cmd[-1] == "/data/repo/x"
+    # the pattern is present
+    assert "foo" in cmd
+    # glob is threaded through (rg --glob or grep --include)
+    assert any("*.cs" in part for part in cmd)
+
+
+# --- multi-repo repo= prefixing (graph/search paths are <repo>/-prefixed) ---
+def test_search_prefixes_match_paths_with_repo(repo: Path):
+    out = file_search.run_search("MaxEncumbrance", local_root=str(repo), repo="code-5x")
+    assert out["matches"], "expected a hit"
+    for m in out["matches"]:
+        assert m["path"].startswith("code-5x/"), m["path"]
+    # exact path round-trips with what read_file would resolve back
+    assert any(m["path"] == "code-5x/config/items.json" for m in out["matches"]), [m["path"] for m in out["matches"]]
+
+
+def test_search_repo_unset_unchanged(repo: Path):
+    out = file_search.run_search("MaxEncumbrance", local_root=str(repo), repo="")
+    assert any(m["path"] == "config/items.json" for m in out["matches"])

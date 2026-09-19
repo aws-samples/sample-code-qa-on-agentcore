@@ -1,0 +1,413 @@
+"""Offline multi-repo tests for build_bridge (阶段2): N sessions + fan-out + routing.
+
+No codegraph-server. A per-workspace fake session returns a result whose file path
+encodes which repo answered, so we can assert: an unset repo fans out across all repos
+(merged), an explicit in-scope repo routes to just that one, an out-of-scope repo is
+rejected, and one repo's error doesn't blank the others.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+SVC_DIR = Path(__file__).resolve().parent.parent
+if str(SVC_DIR) not in sys.path:
+    sys.path.insert(0, str(SVC_DIR))
+
+pytest.importorskip("mcp")
+
+import http_bridge  # noqa: E402
+
+
+class _PerRepoFake:
+    """Fake session keyed by its workspace: returns a hit whose file names the repo so
+    the test can see which session(s) answered. `mode` injects failures for one repo."""
+
+    registry: dict[str, "_PerRepoFake"] = {}
+
+    def __init__(self, workspace, **_kw):
+        self.workspace = workspace
+        self.name = workspace.rstrip("/").rsplit("/", 1)[-1]
+        self.home = _kw.get("home")  # capture the per-repo HOME the bridge passed (不变量2)
+        self.calls = 0
+        self.healthy = True
+        self.health_detail = "ok"
+        self.mode = "ok"  # or "unhealthy" / "raise"
+        _PerRepoFake.registry[self.name] = self
+
+    def start(self):
+        pass
+
+    async def maybe_self_heal(self):
+        pass
+
+    async def call_tool(self, tool_name, arguments):
+        self.calls += 1
+        if self.mode == "unhealthy":
+            raise http_bridge.IndexUnhealthy(f"{self.name} graph empty")
+        if self.mode == "raise":
+            raise RuntimeError("boom")
+        # A hit whose file is "<name>/Foo.cs" so _align_paths re-prefixes to "<name>/<name>/Foo.cs"
+        # — fine for routing assertions (we only check the repo segment appears).
+        return json.dumps({"results": [{"symbol": {"location": {"file": "Foo.cs", "line": 1}}}]})
+
+
+def _build_multi(monkeypatch, names=("alpha", "beta", "gamma")):
+    _PerRepoFake.registry.clear()
+    monkeypatch.setattr(http_bridge, "CodegraphSession", lambda ws, **kw: _PerRepoFake(ws, **kw))
+    monkeypatch.setattr(http_bridge, "acquire_singleton_writer_lock", lambda ws: None)
+    workspaces = [(f"/data/repo/{n}", f"/data/repo/{n}") for n in names]
+    app = http_bridge.build_bridge(workspaces=workspaces, host="127.0.0.1", port=8951)
+    return app
+
+
+def _fn(app, name):
+    return app._tool_manager.get_tool(name).fn  # type: ignore[attr-defined]
+
+
+def test_unset_repo_fans_out_across_all_repos(monkeypatch):
+    app = _build_multi(monkeypatch)
+    out = json.loads(asyncio.run(_fn(app, "codegraph_symbol_search")(query="Foo")))
+    files = [r["symbol"]["location"]["file"] for r in out["results"]]
+    # one hit per repo, each prefixed with its repo name (path honesty), in repo order
+    assert len(files) == 3, files
+    assert files[0].startswith("alpha/") and files[1].startswith("beta/") and files[2].startswith("gamma/"), files
+    # every repo's session was queried exactly once
+    assert all(s.calls == 1 for s in _PerRepoFake.registry.values())
+
+
+def test_explicit_in_scope_repo_routes_to_only_that_repo(monkeypatch):
+    app = _build_multi(monkeypatch)
+    out = json.loads(asyncio.run(_fn(app, "codegraph_symbol_search")(query="Foo", repo="beta")))
+    files = [r["symbol"]["location"]["file"] for r in out["results"]]
+    assert files == ["beta/Foo.cs"], files
+    # ONLY beta was queried; alpha/gamma untouched
+    assert _PerRepoFake.registry["beta"].calls == 1
+    assert _PerRepoFake.registry["alpha"].calls == 0
+    assert _PerRepoFake.registry["gamma"].calls == 0
+
+
+def test_out_of_scope_repo_rejected_in_multi(monkeypatch):
+    app = _build_multi(monkeypatch)
+    out = asyncio.run(_fn(app, "codegraph_symbol_search")(query="Foo", repo="evil"))
+    assert '"repo not in scope"' in out
+    assert all(s.calls == 0 for s in _PerRepoFake.registry.values()), "rejection must not touch any session"
+
+
+def test_fanout_one_repo_unhealthy_does_not_blank_others(monkeypatch):
+    app = _build_multi(monkeypatch)
+    _PerRepoFake.registry["beta"].mode = "unhealthy"  # beta's graph is broken
+    out = json.loads(asyncio.run(_fn(app, "codegraph_symbol_search")(query="Foo")))
+    files = [r["symbol"]["location"]["file"] for r in out["results"]]
+    # alpha + gamma still answer; beta's error contributes nothing (not an error envelope)
+    assert sorted(f.split("/")[0] for f in files) == ["alpha", "gamma"], files
+    assert "error" not in out
+
+
+def test_fanout_all_repos_unhealthy_surfaces_error(monkeypatch):
+    app = _build_multi(monkeypatch)
+    for s in _PerRepoFake.registry.values():
+        s.mode = "unhealthy"
+    out = json.loads(asyncio.run(_fn(app, "codegraph_symbol_search")(query="Foo")))
+    assert out.get("error") == "index unavailable", out
+
+
+def test_health_unhealthy_when_any_repo_unhealthy(monkeypatch):
+    app = _build_multi(monkeypatch)
+    # all healthy initially
+    assert all(s.healthy for s in app.codegraph_sessions)  # type: ignore[attr-defined]
+    app.codegraph_repos[1].session.healthy = False  # type: ignore[attr-defined]
+    app.codegraph_repos[1].session.health_detail = "beta empty"  # type: ignore[attr-defined]
+    # the health handler aggregates: any unhealthy → not ok (we call the logic via the repos)
+    unhealthy = [r for r in app.codegraph_repos if not r.session.healthy]  # type: ignore[attr-defined]
+    assert len(unhealthy) == 1 and unhealthy[0].name == "beta"
+
+
+def test_each_workspace_takes_its_own_writer_lock(monkeypatch):
+    locked = []
+    monkeypatch.setattr(http_bridge, "CodegraphSession", lambda ws, **kw: _PerRepoFake(ws, **kw))
+    monkeypatch.setattr(http_bridge, "acquire_singleton_writer_lock", lambda ws: locked.append(ws))
+    _PerRepoFake.registry.clear()
+    http_bridge.build_bridge(
+        workspaces=[("/data/repo/a", "/data/repo/a"), ("/data/repo/b", "/data/repo/b")],
+        host="127.0.0.1", port=8952,
+    )
+    assert locked == ["/data/repo/a", "/data/repo/b"], locked
+
+
+def test_rejects_both_workspace_and_workspaces(monkeypatch):
+    monkeypatch.setattr(http_bridge, "CodegraphSession", lambda ws, **kw: _PerRepoFake(ws, **kw))
+    monkeypatch.setattr(http_bridge, "acquire_singleton_writer_lock", lambda ws: None)
+    _PerRepoFake.registry.clear()
+    with pytest.raises(ValueError):
+        http_bridge.build_bridge(workspace="/data/repo/a", workspaces=[("/data/repo/b", None)], port=8953)
+
+
+def test_requires_at_least_one_workspace(monkeypatch):
+    monkeypatch.setattr(http_bridge, "CodegraphSession", lambda ws, **kw: _PerRepoFake(ws, **kw))
+    monkeypatch.setattr(http_bridge, "acquire_singleton_writer_lock", lambda ws: None)
+    with pytest.raises(ValueError):
+        http_bridge.build_bridge(workspaces=[], port=8954)
+
+
+# ── file-tool per-repo routing (read_file/read_table by path prefix; search/glob fan-out) ──
+def _build_multi_with_local(monkeypatch, tmp_path, names=("alpha", "beta")):
+    """build_bridge over REAL on-disk local copies (so file tools register + run) with a
+    fake graph session. Each repo gets a distinct file so routing is observable."""
+    _PerRepoFake.registry.clear()
+    monkeypatch.setattr(http_bridge, "CodegraphSession", lambda ws, **kw: _PerRepoFake(ws, **kw))
+    monkeypatch.setattr(http_bridge, "acquire_singleton_writer_lock", lambda ws: None)
+    workspaces = []
+    for n in names:
+        root = tmp_path / n
+        (root / "src").mkdir(parents=True)
+        (root / "src" / f"{n}_only.cs").write_text(f"// {n} marker TOKEN_{n.upper()}\n")
+        (root / "shared.json").write_text(f'{{"repo": "{n}"}}\n')
+        workspaces.append((str(root), str(root)))
+    app = http_bridge.build_bridge(workspaces=workspaces, host="127.0.0.1", port=8961)
+    return app
+
+
+def test_read_file_routes_by_repo_prefix(monkeypatch, tmp_path):
+    app = _build_multi_with_local(monkeypatch, tmp_path)
+    fn = _fn(app, "codegraph_read_file")
+    out = json.loads(asyncio.run(fn(path="beta/shared.json")))
+    assert out.get("path") == "beta/shared.json", out
+    assert '"repo": "beta"' in out["content"], out
+    # alpha's copy is NOT read for a beta-prefixed path
+    out_a = json.loads(asyncio.run(fn(path="alpha/src/alpha_only.cs")))
+    assert "TOKEN_ALPHA" in out_a["content"]
+
+
+def test_read_file_unprefixed_path_in_multi_refuses(monkeypatch, tmp_path):
+    # With multiple repos and no recognizable <repo>/ prefix, refuse rather than guess.
+    app = _build_multi_with_local(monkeypatch, tmp_path)
+    out = json.loads(asyncio.run(_fn(app, "codegraph_read_file")(path="shared.json")))
+    assert "error" in out and "which repo" in out["detail"], out
+
+
+def test_read_file_out_of_scope_prefix_rejected(monkeypatch, tmp_path):
+    app = _build_multi_with_local(monkeypatch, tmp_path)
+    # "evil/x" — evil is not in scope; the seg isn't in scope so it's an un-routable path.
+    out = json.loads(asyncio.run(_fn(app, "codegraph_read_file")(path="evil/x.cs")))
+    assert "error" in out, out
+
+
+def test_search_files_fans_out_across_repos(monkeypatch, tmp_path):
+    app = _build_multi_with_local(monkeypatch, tmp_path)
+    # "marker" appears once per repo → fan-out returns both, each <repo>/-prefixed.
+    out = json.loads(asyncio.run(_fn(app, "codegraph_search_files")(pattern="marker")))
+    paths = sorted(m["path"].split("/")[0] for m in out["matches"])
+    assert paths == ["alpha", "beta"], out
+
+
+def test_search_files_scoped_to_one_repo(monkeypatch, tmp_path):
+    app = _build_multi_with_local(monkeypatch, tmp_path)
+    out = json.loads(asyncio.run(_fn(app, "codegraph_search_files")(pattern="marker", repo="alpha")))
+    assert all(m["path"].startswith("alpha/") for m in out["matches"]), out
+    assert out["matches"], "expected alpha hits"
+
+
+def test_search_files_out_of_scope_repo_rejected(monkeypatch, tmp_path):
+    app = _build_multi_with_local(monkeypatch, tmp_path)
+    out = json.loads(asyncio.run(_fn(app, "codegraph_search_files")(pattern="marker", repo="ghost")))
+    assert '"repo not in scope"' in json.dumps(out)
+
+
+def test_glob_fans_out_across_repos(monkeypatch, tmp_path):
+    app = _build_multi_with_local(monkeypatch, tmp_path)
+    out = json.loads(asyncio.run(_fn(app, "codegraph_glob_files")(pattern="**/*.cs")))
+    prefixes = sorted(p.split("/")[0] for p in out["paths"])
+    assert prefixes == ["alpha", "beta"], out
+
+
+def test_read_table_routes_by_repo_prefix(monkeypatch, tmp_path):
+    # add a csv to beta only
+    (tmp_path / "beta" / "Config").mkdir(parents=True)
+    (tmp_path / "beta" / "Config" / "t.csv").write_text("a,b\n1,2\n")
+    app = _build_multi_with_local(monkeypatch, tmp_path)
+    out = json.loads(asyncio.run(_fn(app, "codegraph_read_table")(path="beta/Config/t.csv")))
+    assert out.get("path") == "beta/Config/t.csv", out
+    assert out.get("kind") == "csv"
+
+
+@pytest.fixture(params=["search", "glob"])
+def file_fanout_call(request, monkeypatch, tmp_path):
+    """Call the registered tool over real files, injecting only repository failures."""
+    import file_search
+    import file_read
+
+    app = _build_multi_with_local(monkeypatch, tmp_path)
+    for name in ("alpha", "beta"):
+        (tmp_path / name / "src" / "second.cs").write_text(f"// second marker in {name}\n")
+    if request.param == "search":
+        module, method = file_search, "search_to_json"
+        tool, list_key = "codegraph_search_files", "matches"
+        match_pattern, empty_pattern = "marker", "missing_marker"
+    else:
+        module, method = file_read, "glob_to_json"
+        tool, list_key = "codegraph_glob_files", "paths"
+        match_pattern, empty_pattern = "**/*.cs", "**/*.missing"
+    real = getattr(module, method)
+
+    def invoke(*, failed=(), empty=False, capped=False):
+        successful = {}
+        if capped:
+            if request.param == "search":
+                run_search = file_search.run_search
+                monkeypatch.setattr(
+                    file_search, "run_search",
+                    lambda pattern, **kwargs: run_search(pattern, max_matches=1, **kwargs),
+                )
+            else:
+                monkeypatch.setattr(file_read, "MAX_GLOB_RESULTS", 1)
+
+        def flaky(pattern, **kwargs):
+            repo = kwargs["repo"]
+            if repo in failed:
+                raise OSError(f"simulated disk fault at {tmp_path / repo}")
+            raw = real(pattern, **kwargs)
+            successful[repo] = json.loads(raw)
+            return raw
+
+        monkeypatch.setattr(module, method, flaky)
+        out = json.loads(asyncio.run(
+            _fn(app, tool)(pattern=empty_pattern if empty else match_pattern),
+        ))
+        assert str(tmp_path) not in json.dumps(out), "host paths must stay in service logs"
+        return out, list_key, successful
+
+    return invoke
+
+
+@pytest.mark.parametrize("failed_repo", ["alpha", "beta"])
+@pytest.mark.parametrize("empty", [False, True], ids=["hits", "no-hits"])
+def test_file_fanout_reports_partial_failure(file_fanout_call, failed_repo, empty):
+    """A failed repo plus an empty successful repo must not look like a full search."""
+    out, list_key, successful = file_fanout_call(failed=(failed_repo,), empty=empty)
+    survivor = "beta" if failed_repo == "alpha" else "alpha"
+    assert out[list_key] == successful[survivor][list_key]
+    assert bool(out[list_key]) is not empty
+    assert out["count"] == len(out[list_key])
+    assert out["partial"] is True
+    assert isinstance(out["warning"], str) and out["warning"].strip()
+    assert "error" not in out
+    assert out["truncated"] is False, "repository failure is not result truncation"
+    assert [r["repo"] for r in out["repo_results"]] == ["alpha", "beta"]
+    records = {r["repo"]: r for r in out["repo_results"]}
+    assert records[failed_repo]["status"] == "error"
+    assert records[failed_repo]["error"]
+    assert records[survivor]["status"] == "ok"
+    assert records[survivor]["metadata"]["count"] == len(out[list_key])
+    assert records[survivor]["metadata"]["truncated"] is False
+
+
+def test_file_fanout_all_repositories_failed_is_an_error(file_fanout_call):
+    out, _, successful = file_fanout_call(failed=("alpha", "beta"))
+    assert successful == {}
+    assert out["error"], "all failures must not become an empty successful search"
+    assert [r["repo"] for r in out["repo_results"]] == ["alpha", "beta"]
+    assert all(r["status"] == "error" and r["error"] for r in out["repo_results"])
+
+
+@pytest.mark.parametrize("empty", [False, True], ids=["hits", "no-hits"])
+def test_file_fanout_success_keeps_per_repository_metadata(file_fanout_call, empty):
+    out, list_key, successful = file_fanout_call(empty=empty)
+    expected = [item for repo in ("alpha", "beta") for item in successful[repo][list_key]]
+    assert out[list_key] == expected
+    assert bool(expected) is not empty
+    assert out["count"] == len(expected)
+    assert not out.get("partial") and not out.get("warning")
+    assert "error" not in out
+    assert out["truncated"] is False
+    assert [r["repo"] for r in out["repo_results"]] == ["alpha", "beta"]
+    for record in out["repo_results"]:
+        assert record["status"] == "ok"
+        assert not record.get("error")
+        assert record["metadata"]["count"] == len(successful[record["repo"]][list_key])
+        assert record["metadata"]["truncated"] is False
+    if list_key == "matches":
+        assert out["deduped"] == sum(data["deduped"] for data in successful.values())
+
+
+@pytest.mark.parametrize("failed", [(), ("alpha",)], ids=["all-ok", "partial"])
+def test_file_fanout_truncation_is_independent_of_partial_failure(file_fanout_call, failed):
+    out, list_key, successful = file_fanout_call(failed=failed, capped=True)
+    assert all(data["truncated"] is True for data in successful.values())
+    assert out["truncated"] is True
+    assert bool(out.get("partial")) is bool(failed)
+    assert "error" not in out
+    assert out["count"] == len(out[list_key]) == len(successful)
+    assert [r["repo"] for r in out["repo_results"]] == ["alpha", "beta"]
+    for record in out["repo_results"]:
+        if record["repo"] in successful:
+            assert record["status"] == "ok"
+            assert record["metadata"]["count"] == 1
+            assert record["metadata"]["truncated"] is True
+
+
+# ── main() arg pairing: repeatable --workspace / --local-workspace (CLI glue) ──
+def test_pair_workspaces_single_repo():
+    from http_bridge import pair_workspaces
+    assert pair_workspaces(["/data/repo/x"], ["/data/repo/x"]) == [("/data/repo/x", "/data/repo/x")]
+
+
+def test_pair_workspaces_single_no_local():
+    from http_bridge import pair_workspaces
+    assert pair_workspaces(["/data/repo/x"], []) == [("/data/repo/x", None)]
+
+
+def test_pair_workspaces_multi_by_position():
+    from http_bridge import pair_workspaces
+    out = pair_workspaces(["/data/repo/a", "/data/repo/b"], ["/data/repo/a", "/data/repo/b"])
+    assert out == [("/data/repo/a", "/data/repo/a"), ("/data/repo/b", "/data/repo/b")]
+
+
+def test_pair_workspaces_fewer_locals_pad_none():
+    from http_bridge import pair_workspaces
+    out = pair_workspaces(["/data/repo/a", "/data/repo/b"], ["/data/repo/a"])
+    assert out == [("/data/repo/a", "/data/repo/a"), ("/data/repo/b", None)]
+
+
+def test_pair_workspaces_requires_at_least_one():
+    from http_bridge import pair_workspaces
+    with pytest.raises(ValueError):
+        pair_workspaces([], [])
+
+
+def test_pair_workspaces_rejects_excess_locals():
+    from http_bridge import pair_workspaces
+    with pytest.raises(ValueError):
+        pair_workspaces(["/data/repo/a"], ["/data/repo/a", "/data/repo/b"])
+
+
+def test_pair_workspaces_rejects_duplicate_workspace():
+    from http_bridge import pair_workspaces
+    with pytest.raises(ValueError):
+        pair_workspaces(["/data/repo/a", "/data/repo/a/"], ["/data/repo/a", "/data/repo/a"])
+
+
+def test_multi_repo_sessions_get_distinct_per_repo_home(monkeypatch):
+    # 不变量2: each repo's session must spawn codegraph with its OWN HOME (<ws>/.home),
+    # else all N sessions share /data/.codegraph and collide. Distinct + correct.
+    _build_multi(monkeypatch, names=("alpha", "beta"))
+    homes = {n: _PerRepoFake.registry[n].home for n in ("alpha", "beta")}
+    assert homes["alpha"] == "/data/repo/alpha/.home", homes
+    assert homes["beta"] == "/data/repo/beta/.home", homes
+    assert homes["alpha"] != homes["beta"]
+
+
+def test_single_repo_session_home_is_per_repo(monkeypatch):
+    # Single repo ALSO uses per-repo HOME=<ws>/.home — it must match where bootstrap's build
+    # unit wrote the graph (the build template ALWAYS uses <ws>/.home, even for one repo). An
+    # earlier version returned None here → serve inherited HOME=/data and served an empty graph
+    # (0 nodes / 503) while the build's graph sat at <ws>/.home. Caught in the first real deploy.
+    _PerRepoFake.registry.clear()
+    monkeypatch.setattr(http_bridge, "CodegraphSession", lambda ws, **kw: _PerRepoFake(ws, **kw))
+    monkeypatch.setattr(http_bridge, "acquire_singleton_writer_lock", lambda ws: None)
+    http_bridge.build_bridge(workspaces=[("/data/repo/solo", "/data/repo/solo")], port=8957)
+    assert _PerRepoFake.registry["solo"].home == "/data/repo/solo/.home"
