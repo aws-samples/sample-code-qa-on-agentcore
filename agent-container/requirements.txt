@@ -5,7 +5,7 @@
 # Security updates must preserve the remaining lock pins and pass dependency
 # and runtime checks. Bumping claude-agent-sdk is "Ask first" per AGENTS.md.
 
-claude-agent-sdk==0.2.103          # agent reasoning loop (query / ClaudeAgentOptions); HTTP MCP native
+claude-agent-sdk==0.2.121          # agent reasoning loop (query / ClaudeAgentOptions); HTTP MCP native
 bedrock-agentcore==1.18.1          # microVM HTTP/streaming host; fixes CVE-2026-16796
 boto3==1.43.31                     # AWS control plane
 httpx==0.28.1                      # CodeGraph MCP-over-HTTP evidence channel
